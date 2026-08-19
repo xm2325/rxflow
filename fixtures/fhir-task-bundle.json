@@ -1,0 +1,45 @@
+{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:rx-task-001",
+      "resource": {
+        "resourceType": "MedicationRequest",
+        "id": "rx-task-001",
+        "subject": { "reference": "Patient/synthetic-task-001" },
+        "medicationReference": { "reference": "Medication/med-task-001" },
+        "insurance": [{ "reference": "Coverage/cov-task-001" }],
+        "note": [{ "text": "Synthetic chart note: prior methotrexate trial with inadequate response." }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Medication",
+        "id": "med-task-001",
+        "code": {
+          "coding": [{
+            "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+            "code": "12345"
+          }]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Coverage",
+        "id": "cov-task-001",
+        "payor": [{ "display": "SYNTHETIC_COMMERCIAL_PLAN" }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Task",
+        "id": "task-msot-001",
+        "status": "requested",
+        "intent": "order",
+        "focus": { "reference": "urn:uuid:rx-task-001" }
+      }
+    }
+  ]
+}

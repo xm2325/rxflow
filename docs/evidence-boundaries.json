@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "releaseVersion": "0.5.0",
+  "evidenceStatus": {
+    "syntheticFHIRWorkflow": "executed-local",
+    "sqliteProcessConcurrency": "executed-local",
+    "postgresAdapter": "implemented-not-live-here",
+    "postgres17CiScenario": "implemented-awaiting-observed-ci-result",
+    "cloudRunCloudSqlPubSub": "reference-only",
+    "epic": "not-integrated",
+    "surescripts": "not-integrated",
+    "realPatientData": "none",
+    "clinicalDeployment": "none",
+    "complianceCertification": "none",
+    "typescriptBuildTool": "locked-dev-dependency"
+  },
+  "forbiddenPositiveClaims": [
+    "deployed to GCP",
+    "deployed on GCP",
+    "production PostgreSQL",
+    "live PostgreSQL verified",
+    "Cloud SQL deployed",
+    "Epic integration",
+    "Surescripts integration",
+    "HIPAA compliant",
+    "HIPAA-compliant",
+    "real patient data",
+    "clinical deployment"
+  ],
+  "publicClaims": [
+    "Synthetic FHIR workflow executed locally",
+    "SQLite multi-process concurrency executed locally",
+    "PostgreSQL adapter implemented; live execution pending CI evidence",
+    "GCP infrastructure is a reference target only"
+  ]
+}
