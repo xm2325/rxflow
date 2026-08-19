@@ -1,0 +1,314 @@
+import { randomUUID } from "node:crypto";
+import type { RxCase } from "./domain.js";
+import type { CaseStore } from "./store.js";
+
+export type IntegrationEventType =
+  | "PrescriptionReceived"
+  | "BenefitsVerified"
+  | "PaDraftGenerated"
+  | "HumanReviewRequired"
+  | "PaApproved"
+  | "PrescriptionRouted"
+  | "WorkflowFailed"
+  | "DeliveryGapDeclared";
+
+export interface IntegrationEvent {
+  eventId: string;
+  type: IntegrationEventType;
+  schemaVersion: 1 | 2;
+  occurredAt: string;
+  caseId: string;
+  correlationId: string;
+  tenantId?: string;
+  aggregateSequence?: number;
+  payload: Record<string, string | number | boolean | null>;
+}
+
+
+const EVENT_TYPES: IntegrationEventType[] = [
+  "PrescriptionReceived", "BenefitsVerified", "PaDraftGenerated", "HumanReviewRequired",
+  "PaApproved", "PrescriptionRouted", "WorkflowFailed", "DeliveryGapDeclared"
+];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function eventContractError(reason: string): never {
+  throw new Error(`invalid_integration_event:${reason}`);
+}
+
+function requireEventString(payload: Record<string, unknown>, field: string): string {
+  const value = payload[field];
+  if (typeof value !== "string" || value.trim() === "") eventContractError(`missing_${field}`);
+  return value;
+}
+
+function requireEventBoolean(payload: Record<string, unknown>, field: string): boolean {
+  const value = payload[field];
+  if (typeof value !== "boolean") eventContractError(`invalid_${field}`);
+  return value;
+}
+
+function requireEventNumber(payload: Record<string, unknown>, field: string, minimum = 0): number {
+  const value = payload[field];
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum) eventContractError(`invalid_${field}`);
+  return value;
+}
+
+export function parseIntegrationEvent(input: unknown): IntegrationEvent {
+  if (!isRecord(input)) eventContractError("body_not_object");
+  const eventId = requireEventString(input, "eventId");
+  const typeValue = requireEventString(input, "type");
+  if (!EVENT_TYPES.includes(typeValue as IntegrationEventType)) eventContractError("unsupported_type");
+  if (input.schemaVersion !== 1 && input.schemaVersion !== 2) eventContractError("unsupported_schema_version");
+  const occurredAt = requireEventString(input, "occurredAt");
+  if (!Number.isFinite(Date.parse(occurredAt))) eventContractError("invalid_occurredAt");
+  const caseId = requireEventString(input, "caseId");
+  const correlationId = requireEventString(input, "correlationId");
+  const tenantId = input.tenantId === undefined ? undefined : requireEventString(input, "tenantId");
+  if (input.aggregateSequence !== undefined && (!Number.isInteger(input.aggregateSequence) || (input.aggregateSequence as number) < 1)) {
+    eventContractError("invalid_aggregate_sequence");
+  }
+  if (!isRecord(input.payload)) eventContractError("payload_not_object");
+  for (const value of Object.values(input.payload)) {
+    if (!(value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean")) {
+      eventContractError("payload_value_not_scalar");
+    }
+  }
+  const payload = input.payload;
+  const type = typeValue as IntegrationEventType;
+  switch (type) {
+    case "PrescriptionReceived":
+      requireEventString(payload, "sourceResourceId");
+      break;
+    case "BenefitsVerified":
+      requireEventBoolean(payload, "priorAuthRequired");
+      break;
+    case "PaDraftGenerated": {
+      const confidence = requireEventNumber(payload, "confidence");
+      if (confidence > 1) eventContractError("invalid_confidence");
+      requireEventNumber(payload, "evidenceCount");
+      requireEventNumber(payload, "validationErrors");
+      break;
+    }
+    case "HumanReviewRequired":
+      requireEventString(payload, "reason");
+      break;
+    case "PaApproved":
+      if (input.schemaVersion === 1) requireEventString(payload, "reviewer");
+      else requireEventBoolean(payload, "edited");
+      break;
+    case "PrescriptionRouted":
+      requireEventString(payload, "route");
+      break;
+    case "WorkflowFailed":
+      requireEventString(payload, "stage");
+      requireEventString(payload, "code");
+      requireEventBoolean(payload, "retryable");
+      requireEventNumber(payload, "attempts", 1);
+      break;
+    case "DeliveryGapDeclared":
+      if (input.schemaVersion !== 2) eventContractError("gap_requires_schema_v2");
+      requireEventString(payload, "retiredEventId");
+      requireEventString(payload, "originalType");
+      requireEventString(payload, "reasonCode");
+      break;
+  }
+  return {
+    eventId,
+    type,
+    schemaVersion: input.schemaVersion as 1 | 2,
+    occurredAt,
+    caseId,
+    correlationId,
+    ...(tenantId ? { tenantId } : {}),
+    ...(typeof input.aggregateSequence === "number" ? { aggregateSequence: input.aggregateSequence } : {}),
+    payload: payload as IntegrationEvent["payload"]
+  };
+}
+
+
+/**
+ * Build the event that is allowed to cross an external integration boundary.
+ *
+ * Runtime parsing proves the durable event is structurally valid, but it may still
+ * contain legacy or accidental extra scalar fields. Reconstructing each payload from
+ * an allow-list keeps the external contract data-minimised. Legacy PaApproved v1
+ * records are upgraded only when the non-identifying `edited` flag is present; a
+ * record that cannot be upgraded safely fails closed instead of publishing reviewer
+ * identity from an old backlog.
+ */
+export function externalizeIntegrationEvent(input: IntegrationEvent): IntegrationEvent {
+  const event = parseIntegrationEvent(input);
+  const common = {
+    eventId: event.eventId,
+    type: event.type,
+    schemaVersion: 2 as const,
+    occurredAt: event.occurredAt,
+    caseId: event.caseId,
+    correlationId: event.correlationId,
+    ...(event.tenantId ? { tenantId: event.tenantId } : {}),
+    ...(typeof event.aggregateSequence === "number" ? { aggregateSequence: event.aggregateSequence } : {})
+  };
+
+  switch (event.type) {
+    case "PrescriptionReceived":
+      return {
+        ...common,
+        payload: {
+          sourceResourceId: requireEventString(event.payload, "sourceResourceId"),
+          ...(typeof event.payload.sourceWorkflow === "string" && event.payload.sourceWorkflow.trim() !== ""
+            ? { sourceWorkflow: event.payload.sourceWorkflow }
+            : {}),
+          ...(typeof event.payload.sourceTaskId === "string" && event.payload.sourceTaskId.trim() !== ""
+            ? { sourceTaskId: event.payload.sourceTaskId }
+            : {})
+        }
+      };
+    case "BenefitsVerified":
+      return { ...common, payload: { priorAuthRequired: requireEventBoolean(event.payload, "priorAuthRequired") } };
+    case "PaDraftGenerated":
+      return {
+        ...common,
+        payload: {
+          confidence: requireEventNumber(event.payload, "confidence"),
+          evidenceCount: requireEventNumber(event.payload, "evidenceCount"),
+          validationErrors: requireEventNumber(event.payload, "validationErrors"),
+          ...(typeof event.payload.recoveredAfterFailures === "number" && Number.isFinite(event.payload.recoveredAfterFailures)
+            ? { recoveredAfterFailures: event.payload.recoveredAfterFailures }
+            : {})
+        }
+      };
+    case "HumanReviewRequired":
+      return { ...common, payload: { reason: requireEventString(event.payload, "reason") } };
+    case "PaApproved": {
+      const edited = event.payload.edited;
+      if (typeof edited !== "boolean") eventContractError("legacy_pa_approved_missing_edited");
+      return { ...common, payload: { edited } };
+    }
+    case "PrescriptionRouted":
+      return { ...common, payload: { route: requireEventString(event.payload, "route") } };
+    case "WorkflowFailed":
+      return {
+        ...common,
+        payload: {
+          stage: requireEventString(event.payload, "stage"),
+          code: requireEventString(event.payload, "code"),
+          retryable: requireEventBoolean(event.payload, "retryable"),
+          attempts: requireEventNumber(event.payload, "attempts", 1)
+        }
+      };
+    case "DeliveryGapDeclared":
+      return {
+        ...common,
+        payload: {
+          retiredEventId: requireEventString(event.payload, "retiredEventId"),
+          originalType: requireEventString(event.payload, "originalType"),
+          reasonCode: requireEventString(event.payload, "reasonCode")
+        }
+      };
+  }
+}
+
+export const DELIVERY_GAP_REASON_CODES = [
+  "downstream_reconciled",
+  "obsolete_contract",
+  "duplicate_transition",
+  "source_corrected_out_of_band"
+] as const;
+
+export type DeliveryGapReasonCode = typeof DELIVERY_GAP_REASON_CODES[number];
+
+export function isDeliveryGapReasonCode(value: unknown): value is DeliveryGapReasonCode {
+  return typeof value === "string" && (DELIVERY_GAP_REASON_CODES as readonly string[]).includes(value);
+}
+
+export type OutboxStatus = "PENDING" | "IN_FLIGHT" | "PUBLISHED" | "DEAD_LETTER" | "RETIRED";
+
+export interface OutboxRecord {
+  event: IntegrationEvent;
+  status: OutboxStatus;
+  attempts: number;
+  lastError?: string;
+  publishedAt?: string;
+  claimId?: string;
+  claimedBy?: string;
+  leaseUntil?: string;
+  nextAttemptAt?: string;
+  enqueuedAt?: string;
+  retiredAt?: string;
+  retiredBy?: string;
+  retirementReasonCode?: DeliveryGapReasonCode;
+  retirementReference?: string;
+  replacementEventId?: string;
+  recoveryGeneration?: number;
+}
+
+export interface ClaimedOutboxRecord extends OutboxRecord {
+  status: "IN_FLIGHT";
+  claimId: string;
+  claimedBy: string;
+  leaseUntil: string;
+}
+
+export function integrationEvent(
+  type: IntegrationEventType,
+  rxCase: RxCase,
+  payload: IntegrationEvent["payload"] = {}
+): IntegrationEvent {
+  rxCase.eventSequence = (Number.isInteger(rxCase.eventSequence) && rxCase.eventSequence >= 0 ? rxCase.eventSequence : 0) + 1;
+  return {
+    eventId: randomUUID(),
+    type,
+    schemaVersion: 2,
+    occurredAt: new Date().toISOString(),
+    caseId: rxCase.id,
+    correlationId: rxCase.correlationId,
+    ...(rxCase.tenantId ? { tenantId: rxCase.tenantId } : {}),
+    aggregateSequence: rxCase.eventSequence,
+    payload
+  };
+}
+
+export interface EventSink {
+  deliver(event: IntegrationEvent): Promise<void>;
+}
+
+/**
+ * A delivery failure may be retryable (network outage, 429, 5xx) or terminal
+ * (invalid payload, non-retryable 4xx). Retryable failures may also carry a
+ * downstream Retry-After floor that is applied on top of local jittered backoff.
+ */
+export type DeliveryFailureScope = "record" | "tenant" | "global";
+
+export class DeliveryError extends Error {
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+  readonly stopBatch: boolean;
+  readonly failureScope: DeliveryFailureScope;
+
+  constructor(message: string, options: { retryable?: boolean; retryAfterMs?: number; stopBatch?: boolean; failureScope?: DeliveryFailureScope } = {}) {
+    super(message);
+    this.name = "DeliveryError";
+    this.retryable = options.retryable ?? true;
+    this.failureScope = options.failureScope ?? (options.stopBatch ? "global" : "record");
+    this.stopBatch = this.failureScope !== "record";
+    if (options.retryAfterMs !== undefined) {
+      if (!Number.isFinite(options.retryAfterMs) || options.retryAfterMs < 0) throw new Error("invalid_delivery_retry_after");
+      this.retryAfterMs = Math.floor(options.retryAfterMs);
+    }
+  }
+}
+
+function classifyDeliveryFailure(error: unknown): { message: string; retryable: boolean; retryAfterMs?: number; stopBatch: boolean; failureScope: DeliveryFailureScope } {
+  if (error instanceof DeliveryError) {
+    return {
+      message: error.message,
+      retryable: error.retryable,
+      stopBatch: error.stopBatch,
+      failureScope: error.failureScope,
+      ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {})
+    };
+  }
+  const message = error instanceof Error ? error.message : "delivery_internal_error";
