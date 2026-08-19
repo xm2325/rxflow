@@ -1,0 +1,109 @@
+    // back of the ready queue. This keeps one slow tenant from occupying a delivery
+    // slot for its whole claim quantum while still guaranteeing at most one active
+    // external request per tenant in this dispatcher.
+    const runScheduler = async (): Promise<void> => {
+      await new Promise<void>((resolve, reject) => {
+        let running = 0;
+        let settled = false;
+
+        const finishIfDone = (): void => {
+          if (settled) return;
+          if (running === 0 && (globalStop || readyLanes.length === 0)) {
+            settled = true;
+            resolve();
+          }
+        };
+
+        const schedule = (): void => {
+          if (settled) return;
+          while (!globalStop && running < this.maxConcurrentTenants && readyLanes.length > 0) {
+            const lane = readyLanes.shift()!;
+            while (lane.index < lane.records.length && !activeClaims.has(lane.records[lane.index].event.eventId)) lane.index += 1;
+            if (lane.index >= lane.records.length) continue;
+            const record = lane.records[lane.index];
+            lane.index += 1;
+            running += 1;
+            void handleRecord(record).then((result) => {
+              running -= 1;
+              if (result === "continue") {
+                while (lane.index < lane.records.length && !activeClaims.has(lane.records[lane.index].event.eventId)) lane.index += 1;
+                if (lane.index < lane.records.length && !globalStop) readyLanes.push(lane);
+              }
+              schedule();
+              finishIfDone();
+            }, (error) => {
+              if (settled) return;
+              settled = true;
+              reject(error);
+            });
+          }
+          finishIfDone();
+        };
+
+        schedule();
+      });
+    };
+
+    try {
+      await runScheduler();
+    } finally {
+      clearInterval(heartbeat);
+      if (heartbeatPromise) await heartbeatPromise;
+    }
+
+    return report;
+  }
+}
+
+export class MetadataLogEventSink implements EventSink {
+  constructor(private readonly log: (line: string) => void = console.log) {}
+
+  async deliver(event: IntegrationEvent): Promise<void> {
+    this.log(JSON.stringify({
+      event: "integration_event_published",
+      eventId: event.eventId,
+      type: event.type,
+      schemaVersion: event.schemaVersion,
+      correlationId: event.correlationId
+    }));
+  }
+}
+
+export class BackgroundOutboxPublisher {
+  private active?: Promise<DispatchReport>;
+
+  constructor(private readonly dispatcher: OutboxDispatcher) {}
+
+  isActive(): boolean {
+    return this.active !== undefined;
+  }
+
+  async tick(): Promise<DispatchReport | undefined> {
+    if (this.active) return undefined;
+    const active = this.dispatcher.drain();
+    this.active = active;
+    try {
+      return await active;
+    } finally {
+      if (this.active === active) this.active = undefined;
+    }
+  }
+
+  async waitForIdle(timeoutMs = 10_000): Promise<boolean> {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new Error("invalid_publisher_idle_timeout");
+    const active = this.active;
+    if (!active) return true;
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve(false);
+      }, timeoutMs);
+      active.then(
+        () => { if (!settled) { settled = true; clearTimeout(timer); resolve(true); } },
+        () => { if (!settled) { settled = true; clearTimeout(timer); resolve(true); } }
+      );
+    });
+  }
+}
