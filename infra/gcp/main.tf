@@ -172,11 +172,26 @@ resource "google_cloud_run_v2_service" "api" {
         mount_path = "/cloudsql"
       }
 
-      env { name = "NODE_ENV" value = "production" }
-      env { name = "RXFLOW_RUNTIME_ROLE" value = "api" }
-      env { name = "RXFLOW_CLOUD_SQL_INSTANCE" value = google_sql_database_instance.rxflow.connection_name }
-      env { name = "RXFLOW_PGDATABASE" value = google_sql_database.rxflow.name }
-      env { name = "RXFLOW_PGUSER" value = google_sql_user.rxflow.name }
+      env {
+        name  = "NODE_ENV"
+        value = "production"
+      }
+      env {
+        name  = "RXFLOW_RUNTIME_ROLE"
+        value = "api"
+      }
+      env {
+        name  = "RXFLOW_CLOUD_SQL_INSTANCE"
+        value = google_sql_database_instance.rxflow.connection_name
+      }
+      env {
+        name  = "RXFLOW_PGDATABASE"
+        value = google_sql_database.rxflow.name
+      }
+      env {
+        name  = "RXFLOW_PGUSER"
+        value = google_sql_user.rxflow.name
+      }
       env {
         name = "RXFLOW_PGPASSWORD"
         value_source {
@@ -186,12 +201,30 @@ resource "google_cloud_run_v2_service" "api" {
           }
         }
       }
-      env { name = "RXFLOW_PG_SCHEMA_MODE" value = "verify" }
-      env { name = "RXFLOW_PG_POOL_MAX" value = tostring(var.postgres_pool_max) }
-      env { name = "RXFLOW_PUBLISH_INTERVAL_MS" value = "0" }
-      env { name = "RXFLOW_OUTBOX_PENDING_AGE_TARGET_MS" value = tostring(var.outbox_pending_age_target_ms) }
-      env { name = "RXFLOW_EXTERNAL_OUTBOX_WORKER" value = "true" }
-      env { name = "RXFLOW_TRUST_PLATFORM_IAM" value = "true" }
+      env {
+        name  = "RXFLOW_PG_SCHEMA_MODE"
+        value = "verify"
+      }
+      env {
+        name  = "RXFLOW_PG_POOL_MAX"
+        value = tostring(var.postgres_pool_max)
+      }
+      env {
+        name  = "RXFLOW_PUBLISH_INTERVAL_MS"
+        value = "0"
+      }
+      env {
+        name  = "RXFLOW_OUTBOX_PENDING_AGE_TARGET_MS"
+        value = tostring(var.outbox_pending_age_target_ms)
+      }
+      env {
+        name  = "RXFLOW_EXTERNAL_OUTBOX_WORKER"
+        value = "true"
+      }
+      env {
+        name  = "RXFLOW_TRUST_PLATFORM_IAM"
+        value = "true"
+      }
     }
 
     volumes {
@@ -243,11 +276,26 @@ resource "google_cloud_run_v2_service" "outbox_worker" {
         mount_path = "/cloudsql"
       }
 
-      env { name = "NODE_ENV" value = "production" }
-      env { name = "RXFLOW_RUNTIME_ROLE" value = "worker" }
-      env { name = "RXFLOW_CLOUD_SQL_INSTANCE" value = google_sql_database_instance.rxflow.connection_name }
-      env { name = "RXFLOW_PGDATABASE" value = google_sql_database.rxflow.name }
-      env { name = "RXFLOW_PGUSER" value = google_sql_user.rxflow.name }
+      env {
+        name  = "NODE_ENV"
+        value = "production"
+      }
+      env {
+        name  = "RXFLOW_RUNTIME_ROLE"
+        value = "worker"
+      }
+      env {
+        name  = "RXFLOW_CLOUD_SQL_INSTANCE"
+        value = google_sql_database_instance.rxflow.connection_name
+      }
+      env {
+        name  = "RXFLOW_PGDATABASE"
+        value = google_sql_database.rxflow.name
+      }
+      env {
+        name  = "RXFLOW_PGUSER"
+        value = google_sql_user.rxflow.name
+      }
       env {
         name = "RXFLOW_PGPASSWORD"
         value_source {
@@ -257,14 +305,38 @@ resource "google_cloud_run_v2_service" "outbox_worker" {
           }
         }
       }
-      env { name = "RXFLOW_PG_SCHEMA_MODE" value = "verify" }
-      env { name = "RXFLOW_PG_POOL_MAX" value = tostring(var.worker_postgres_pool_max) }
-      env { name = "RXFLOW_PUBLISH_INTERVAL_MS" value = tostring(var.worker_publish_interval_ms) }
-      env { name = "RXFLOW_OUTBOX_PER_TENANT_CLAIM_LIMIT" value = tostring(var.worker_per_tenant_claim_limit) }
-      env { name = "RXFLOW_OUTBOX_TENANT_DELIVERY_CONCURRENCY" value = tostring(var.worker_tenant_delivery_concurrency) }
-      env { name = "RXFLOW_OUTBOX_PENDING_AGE_TARGET_MS" value = tostring(var.outbox_pending_age_target_ms) }
-      env { name = "RXFLOW_PUBSUB_PROJECT" value = var.project_id }
-      env { name = "RXFLOW_PUBSUB_TOPIC" value = google_pubsub_topic.events.name }
+      env {
+        name  = "RXFLOW_PG_SCHEMA_MODE"
+        value = "verify"
+      }
+      env {
+        name  = "RXFLOW_PG_POOL_MAX"
+        value = tostring(var.worker_postgres_pool_max)
+      }
+      env {
+        name  = "RXFLOW_PUBLISH_INTERVAL_MS"
+        value = tostring(var.worker_publish_interval_ms)
+      }
+      env {
+        name  = "RXFLOW_OUTBOX_PER_TENANT_CLAIM_LIMIT"
+        value = tostring(var.worker_per_tenant_claim_limit)
+      }
+      env {
+        name  = "RXFLOW_OUTBOX_TENANT_DELIVERY_CONCURRENCY"
+        value = tostring(var.worker_tenant_delivery_concurrency)
+      }
+      env {
+        name  = "RXFLOW_OUTBOX_PENDING_AGE_TARGET_MS"
+        value = tostring(var.outbox_pending_age_target_ms)
+      }
+      env {
+        name  = "RXFLOW_PUBSUB_PROJECT"
+        value = var.project_id
+      }
+      env {
+        name  = "RXFLOW_PUBSUB_TOPIC"
+        value = google_pubsub_topic.events.name
+      }
     }
 
     volumes {
@@ -310,10 +382,22 @@ resource "google_cloud_run_v2_job" "migrate" {
           mount_path = "/cloudsql"
         }
 
-        env { name = "NODE_ENV" value = "production" }
-        env { name = "RXFLOW_CLOUD_SQL_INSTANCE" value = google_sql_database_instance.rxflow.connection_name }
-        env { name = "RXFLOW_PGDATABASE" value = google_sql_database.rxflow.name }
-        env { name = "RXFLOW_PGUSER" value = google_sql_user.rxflow.name }
+        env {
+          name  = "NODE_ENV"
+          value = "production"
+        }
+        env {
+          name  = "RXFLOW_CLOUD_SQL_INSTANCE"
+          value = google_sql_database_instance.rxflow.connection_name
+        }
+        env {
+          name  = "RXFLOW_PGDATABASE"
+          value = google_sql_database.rxflow.name
+        }
+        env {
+          name  = "RXFLOW_PGUSER"
+          value = google_sql_user.rxflow.name
+        }
         env {
           name = "RXFLOW_PGPASSWORD"
           value_source {
@@ -323,7 +407,10 @@ resource "google_cloud_run_v2_job" "migrate" {
             }
           }
         }
-        env { name = "RXFLOW_PG_SCHEMA_MODE" value = "migrate" }
+        env {
+          name  = "RXFLOW_PG_SCHEMA_MODE"
+          value = "migrate"
+        }
       }
 
       volumes {
