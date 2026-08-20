@@ -40,6 +40,37 @@ function caseTenantId(rxCase: RxCase): string {
   return rxCase.tenantId ?? DEFAULT_TENANT;
 }
 
+const DEFAULT_REVIEW_LEASE_MS = 5 * 60_000;
+const MIN_REVIEW_LEASE_MS = 30_000;
+const MAX_REVIEW_LEASE_MS = 30 * 60_000;
+
+function normalizeReviewDecisionKey(value?: string): string | undefined {
+  if (value === undefined) return undefined;
+  const key = value.trim();
+  if (key.length < 8 || key.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._~:+/=\-]*$/.test(key)) {
+    throw new AppError("invalid_review_idempotency_key", 400, false, "Review idempotency keys must be opaque 8-128 character tokens.");
+  }
+  return key;
+}
+
+function reviewFingerprint(input: Record<string, unknown>): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
+function decisionKeyHash(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+function activeReviewClaim(rxCase: RxCase, now = new Date()): RxCase["reviewClaim"] | undefined {
+  const claim = rxCase.reviewClaim;
+  if (!claim) return undefined;
+  return Date.parse(claim.leaseUntil) > now.getTime() ? claim : undefined;
+}
+
+function detachedCase(rxCase: RxCase): RxCase {
+  return JSON.parse(JSON.stringify(rxCase)) as RxCase;
+}
+
 
 function deterministicPaRule(payerPlan: string, medicationCode: string): boolean {
   const digest = createHash("sha256").update(`${payerPlan}|${medicationCode}`).digest();
@@ -103,8 +134,6 @@ export class RxWorkflowService {
       ]);
     } catch (error) {
       if (!(error instanceof IdempotencyKeyAlreadyBoundError)) throw error;
-      // Another instance may have bound the key after our initial lookup. Resolve the
-      // durable winner instead of converting a legitimate same-request race into a 500.
       const winner = await this.store.getByIdempotencyKey(key, tenantId);
       if (!winner) throw new AppError("idempotency_race_unresolved", 503, true, "The request raced with another ingestion and the winning case is not visible yet; retry with the same idempotency key.");
       if (winner.requestFingerprint !== fingerprint) {
@@ -229,23 +258,112 @@ export class RxWorkflowService {
     }
   }
 
-  async approve(caseId: string, reviewer: string, expectedVersion: number, finalAnswer?: string, tenantIdInput?: string): Promise<RxCase> {
+  private async lookupReviewDecisionReservation(
+    bindingKey: string,
+    fingerprint: string,
+    caseId: string,
+    tenantId: string,
+    keyHash: string
+  ): Promise<"reserved" | RxCase | undefined> {
+    const existing = await this.store.getByIdempotencyKey(bindingKey, tenantId);
+    if (!existing) return undefined;
+    if (existing.case.id !== caseId || existing.requestFingerprint !== fingerprint) {
+      this.metrics.increment("review_idempotency_conflicts_total");
+      throw new AppError("review_idempotency_key_conflict", 409, false, "The review decision key was already used for a different decision.");
+    }
+    if (existing.case.reviewReceipts?.some((receipt) => receipt.decisionKeyHash === keyHash)) {
+      this.metrics.increment("review_idempotent_replays_total");
+      return existing.case;
+    }
+    return "reserved";
+  }
+
+  private async bindReviewDecisionReservation(
+    bindingKey: string,
+    fingerprint: string,
+    caseId: string,
+    tenantId: string,
+    keyHash: string
+  ): Promise<RxCase | undefined> {
+    try {
+      await this.store.bindIdempotencyKey(bindingKey, caseId, fingerprint, tenantId);
+      return undefined;
+    } catch (error) {
+      if (!(error instanceof IdempotencyKeyAlreadyBoundError)) throw error;
+      const winner = await this.store.getByIdempotencyKey(bindingKey, tenantId);
+      if (!winner || winner.case.id !== caseId || winner.requestFingerprint !== fingerprint) {
+        this.metrics.increment("review_idempotency_conflicts_total");
+        throw new AppError("review_idempotency_key_conflict", 409, false, "The review decision key was already used for a different decision.");
+      }
+      if (winner.case.reviewReceipts?.some((receipt) => receipt.decisionKeyHash === keyHash)) {
+        this.metrics.increment("review_idempotent_replays_total");
+        return winner.case;
+      }
+      return undefined;
+    }
+  }
+
+  async claimReview(
+    caseId: string,
+    reviewer: string,
+    expectedVersion: number,
+    tenantIdInput?: string,
+    leaseMs = DEFAULT_REVIEW_LEASE_MS,
+    now = new Date()
+  ): Promise<RxCase> {
+    const tenantId = normalizedTenantId(tenantIdInput);
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+      throw new AppError("invalid_review_version", 400, false, "A valid reviewed case version is required.");
+    }
+    if (!Number.isInteger(leaseMs) || leaseMs < MIN_REVIEW_LEASE_MS || leaseMs > MAX_REVIEW_LEASE_MS) {
+      throw new AppError("invalid_review_lease", 400, false, "Review leases must be between 30 seconds and 30 minutes.");
+    }
+    const current = await this.store.get(caseId, tenantId);
+    if (!current || caseTenantId(current) !== tenantId) throw new AppError("case_not_found", 404, false, "Case not found.");
+    if (current.status !== "HUMAN_REVIEW_REQUIRED" && current.status !== "SECOND_APPROVAL_REQUIRED") {
+      throw new AppError("case_not_reviewable", 409, false, "The case is not waiting for human review.");
+    }
+    if (current.version !== expectedVersion) {
+      throw new AppError("stale_review", 412, false, "The case changed before it could be claimed. Reload the case and retry.");
+    }
+    const active = activeReviewClaim(current, now);
+    if (active?.reviewer === reviewer) return current;
+    if (active) {
+      throw new AppError("review_already_claimed", 409, false, "Another reviewer currently holds the review lease.");
+    }
+    const rxCase = detachedCase(current);
+    rxCase.reviewClaim = {
+      claimId: randomUUID(),
+      reviewer,
+      claimedAt: now.toISOString(),
+      leaseUntil: new Date(now.getTime() + leaseMs).toISOString()
+    };
+    audit(rxCase, "review_claimed", { reviewer, leaseMs, stage: rxCase.status });
+    rxCase.version = expectedVersion + 1;
+    const saved = await this.store.saveWithOutboxIfVersion(rxCase, expectedVersion, []);
+    if (!saved) throw new AppError("review_claim_conflict", 409, false, "The case changed before the review lease could be committed.");
+    this.metrics.increment("review_claims_total");
+    return rxCase;
+  }
+
+  async approve(
+    caseId: string,
+    reviewer: string,
+    expectedVersion: number,
+    finalAnswer?: string,
+    tenantIdInput?: string,
+    reviewIdempotencyKey?: string,
+    requireActiveClaim = false,
+    now = new Date()
+  ): Promise<RxCase> {
     const tenantId = normalizedTenantId(tenantIdInput);
     const current = await this.store.get(caseId, tenantId);
     if (!current || caseTenantId(current) !== tenantId) throw new AppError("case_not_found", 404, false, "Case not found.");
-    if (current.status !== "HUMAN_REVIEW_REQUIRED") throw new AppError("case_not_reviewable", 409, false, "The case is not waiting for human review.");
     if (!current.paDraft) throw new AppError("missing_pa_draft", 409, false, "No PA draft is available for review.");
     if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
       throw new AppError("invalid_review_version", 400, false, "A valid reviewed case version is required.");
     }
-    if (current.version !== expectedVersion) {
-      this.metrics.increment("stale_review_decisions_total");
-      throw new AppError("stale_review", 412, false, "The case changed after it was reviewed. Reload the case before deciding again.");
-    }
 
-    // Work on a detached copy. In-memory storage otherwise aliases the object held by the store,
-    // which would mutate the persisted status before the compare-and-swap check.
-    const rxCase = JSON.parse(JSON.stringify(current)) as RxCase;
     let reviewedAnswer = current.paDraft.answer;
     if (finalAnswer !== undefined) {
       if (typeof finalAnswer !== "string" || finalAnswer.trim() === "") {
@@ -256,14 +374,78 @@ export class RxWorkflowService {
       }
       reviewedAnswer = finalAnswer.trim();
     }
+
+    const idempotencyKey = normalizeReviewDecisionKey(reviewIdempotencyKey);
+    const bindingKey = idempotencyKey ? `review:${idempotencyKey}` : undefined;
+    const fingerprint = idempotencyKey ? reviewFingerprint({
+      action: "approve", caseId, reviewer, expectedVersion, finalAnswer: reviewedAnswer
+    }) : undefined;
+    const keyHash = bindingKey ? decisionKeyHash(bindingKey) : undefined;
+    const existingReservation = bindingKey && fingerprint && keyHash
+      ? await this.lookupReviewDecisionReservation(bindingKey, fingerprint, caseId, tenantId, keyHash)
+      : undefined;
+    if (existingReservation && existingReservation !== "reserved") return existingReservation;
+
+    if (current.status !== "HUMAN_REVIEW_REQUIRED") throw new AppError("case_not_reviewable", 409, false, "The case is not waiting for first human review.");
+    if (current.version !== expectedVersion) {
+      this.metrics.increment("stale_review_decisions_total");
+      throw new AppError("stale_review", 412, false, "The case changed after it was reviewed. Reload the case before deciding again.");
+    }
+    const active = activeReviewClaim(current, now);
+    if (requireActiveClaim && (!active || active.reviewer !== reviewer)) {
+      throw new AppError("review_claim_required", 409, false, "An active review lease owned by the reviewer is required before deciding.");
+    }
+    if (active && active.reviewer !== reviewer) {
+      throw new AppError("review_claim_mismatch", 409, false, "The review lease is owned by another reviewer.");
+    }
+    if (bindingKey && fingerprint && keyHash && existingReservation !== "reserved") {
+      const replay = await this.bindReviewDecisionReservation(bindingKey, fingerprint, caseId, tenantId, keyHash);
+      if (replay) return replay;
+    }
+
+    const rxCase = detachedCase(current);
     const edited = reviewedAnswer !== current.paDraft.answer;
-    const reviewedAt = new Date().toISOString();
+    const reviewedAt = now.toISOString();
     rxCase.reviewDecision = { reviewer, edited, finalAnswer: reviewedAnswer, reviewedAt };
+    rxCase.reviewClaim = undefined;
     if (edited) audit(rxCase, "pa_draft_edited_by_reviewer", { reviewer, answerChars: reviewedAnswer.length });
+
+    const needsSecondApproval = edited && current.paDraft.confidence < 0.8;
+    rxCase.reviewReceipts ??= [];
+    const receiptId = randomUUID();
+    if (needsSecondApproval) {
+      rxCase.status = "SECOND_APPROVAL_REQUIRED";
+      rxCase.reviewEscalation = {
+        requestedBy: reviewer,
+        requestedAt: reviewedAt,
+        reasonCode: "LOW_CONFIDENCE_EDIT",
+        proposedAnswer: reviewedAnswer
+      };
+      rxCase.reviewReceipts.push({
+        receiptId, outcome: "SECOND_APPROVAL_REQUIRED", reviewer,
+        caseVersion: expectedVersion + 1, edited: true, createdAt: reviewedAt, ...(keyHash ? { decisionKeyHash: keyHash } : {})
+      });
+      audit(rxCase, "second_approval_required", { reviewer, reasonCode: "LOW_CONFIDENCE_EDIT", receiptId });
+      rxCase.version = expectedVersion + 1;
+      const saved = await this.store.saveWithOutboxIfVersion(rxCase, expectedVersion, []);
+      if (!saved) {
+        const winner = await this.store.get(caseId, tenantId);
+        if (keyHash && winner?.reviewReceipts?.some((receipt) => receipt.decisionKeyHash === keyHash)) return winner;
+        throw new AppError("review_conflict", 409, false, "The case changed before this review could be committed. Reload the case before retrying.");
+      }
+      this.metrics.increment("second_approval_requests_total");
+      return rxCase;
+    }
+
+    rxCase.reviewEscalation = undefined;
     rxCase.status = "PA_APPROVED";
-    audit(rxCase, "pa_approved", { reviewer, edited });
+    audit(rxCase, "pa_approved", { reviewer, edited, receiptId });
     rxCase.status = "ROUTED";
     audit(rxCase, "prescription_routed", { route: "synthetic_internal_pharmacy" });
+    rxCase.reviewReceipts.push({
+      receiptId, outcome: "ROUTED", reviewer,
+      caseVersion: expectedVersion + 1, edited, createdAt: reviewedAt, ...(keyHash ? { decisionKeyHash: keyHash } : {})
+    });
     const events = [
       integrationEvent("PaApproved", rxCase, { edited }),
       integrationEvent("PrescriptionRouted", rxCase, { route: "synthetic_internal_pharmacy" })
@@ -271,9 +453,89 @@ export class RxWorkflowService {
     rxCase.version = expectedVersion + 1;
     const saved = await this.store.saveWithOutboxIfVersion(rxCase, expectedVersion, events);
     if (!saved) {
+      const winner = await this.store.get(caseId, tenantId);
+      if (keyHash && winner?.reviewReceipts?.some((receipt) => receipt.decisionKeyHash === keyHash)) return winner;
       this.metrics.increment("review_conflicts_total");
       throw new AppError("review_conflict", 409, false, "The case changed before this review could be committed. Reload the case before retrying.");
     }
+    this.metrics.increment("human_approvals_total");
+    this.metrics.increment("routed_total");
+    return rxCase;
+  }
+
+  async secondApprove(
+    caseId: string,
+    reviewer: string,
+    expectedVersion: number,
+    tenantIdInput?: string,
+    reviewIdempotencyKey?: string,
+    requireActiveClaim = false,
+    now = new Date()
+  ): Promise<RxCase> {
+    const tenantId = normalizedTenantId(tenantIdInput);
+    const current = await this.store.get(caseId, tenantId);
+    if (!current || caseTenantId(current) !== tenantId) throw new AppError("case_not_found", 404, false, "Case not found.");
+    const firstDecision = current.reviewDecision;
+    if (!firstDecision) throw new AppError("second_approval_not_required", 409, false, "The case has no first review decision.");
+    const firstReviewer = firstDecision.reviewer;
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+      throw new AppError("invalid_review_version", 400, false, "A valid reviewed case version is required.");
+    }
+    const idempotencyKey = normalizeReviewDecisionKey(reviewIdempotencyKey);
+    const bindingKey = idempotencyKey ? `second-review:${idempotencyKey}` : undefined;
+    const fingerprint = idempotencyKey ? reviewFingerprint({
+      action: "secondApprove", caseId, reviewer, expectedVersion, firstReviewer
+    }) : undefined;
+    const keyHash = bindingKey ? decisionKeyHash(bindingKey) : undefined;
+    const existingReservation = bindingKey && fingerprint && keyHash
+      ? await this.lookupReviewDecisionReservation(bindingKey, fingerprint, caseId, tenantId, keyHash)
+      : undefined;
+    if (existingReservation && existingReservation !== "reserved") return existingReservation;
+    if (current.status !== "SECOND_APPROVAL_REQUIRED" || !current.reviewEscalation) {
+      throw new AppError("second_approval_not_required", 409, false, "The case is not waiting for second approval.");
+    }
+    if (reviewer === firstReviewer) {
+      throw new AppError("second_approver_must_differ", 409, false, "The second approver must be different from the first reviewer.");
+    }
+    if (current.version !== expectedVersion) throw new AppError("stale_review", 412, false, "The case changed before second approval. Reload it before deciding.");
+    const active = activeReviewClaim(current, now);
+    if (requireActiveClaim && (!active || active.reviewer !== reviewer)) {
+      throw new AppError("review_claim_required", 409, false, "An active review lease owned by the second reviewer is required before deciding.");
+    }
+    if (active && active.reviewer !== reviewer) throw new AppError("review_claim_mismatch", 409, false, "The review lease is owned by another reviewer.");
+    if (bindingKey && fingerprint && keyHash && existingReservation !== "reserved") {
+      const replay = await this.bindReviewDecisionReservation(bindingKey, fingerprint, caseId, tenantId, keyHash);
+      if (replay) return replay;
+    }
+
+    const rxCase = detachedCase(current);
+    const secondReviewedAt = now.toISOString();
+    rxCase.reviewDecision = { ...firstDecision, secondReviewer: reviewer, secondReviewedAt };
+    rxCase.reviewClaim = undefined;
+    rxCase.status = "PA_APPROVED";
+    const receiptId = randomUUID();
+    audit(rxCase, "second_approval_granted", { firstReviewer, secondReviewer: reviewer, receiptId });
+    audit(rxCase, "pa_approved", { reviewer: firstReviewer, secondReviewer: reviewer, edited: firstDecision.edited, receiptId });
+    rxCase.status = "ROUTED";
+    audit(rxCase, "prescription_routed", { route: "synthetic_internal_pharmacy" });
+    rxCase.reviewReceipts ??= [];
+    rxCase.reviewReceipts.push({
+      receiptId, outcome: "ROUTED_AFTER_SECOND_APPROVAL", reviewer: firstReviewer,
+      secondReviewer: reviewer, caseVersion: expectedVersion + 1, edited: firstDecision.edited, createdAt: secondReviewedAt, ...(keyHash ? { decisionKeyHash: keyHash } : {})
+    });
+    rxCase.reviewEscalation = undefined;
+    const events = [
+      integrationEvent("PaApproved", rxCase, { edited: firstDecision.edited }),
+      integrationEvent("PrescriptionRouted", rxCase, { route: "synthetic_internal_pharmacy" })
+    ];
+    rxCase.version = expectedVersion + 1;
+    const saved = await this.store.saveWithOutboxIfVersion(rxCase, expectedVersion, events);
+    if (!saved) {
+      const winner = await this.store.get(caseId, tenantId);
+      if (keyHash && winner?.reviewReceipts?.some((receipt) => receipt.decisionKeyHash === keyHash)) return winner;
+      throw new AppError("review_conflict", 409, false, "The case changed before second approval could be committed. Reload it before retrying.");
+    }
+    this.metrics.increment("second_approvals_total");
     this.metrics.increment("human_approvals_total");
     this.metrics.increment("routed_total");
     return rxCase;
