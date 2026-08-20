@@ -25,6 +25,9 @@ declare module "node:fs/promises" {
   export function readdir(path: URL | string): Promise<string[]>;
   export function readdir(path: URL | string, options: { recursive: true }): Promise<string[]>;
   export function access(path: URL | string): Promise<void>;
+  export function mkdtemp(prefix: string): Promise<string>;
+  export function mkdir(path: string, options?: { recursive?: boolean }): Promise<string | undefined>;
+  export function writeFile(path: string, data: string, encoding?: "utf8"): Promise<void>;
 }
 
 declare module "node:http" {
@@ -46,7 +49,10 @@ declare module "node:http" {
 declare module "node:assert/strict" {
   const assert: {
     equal(actual: unknown, expected: unknown): void;
+    deepEqual(actual: unknown, expected: unknown): void;
     ok(value: unknown): void;
+    match(actual: string, expected: RegExp): void;
+    doesNotMatch(actual: string, expected: RegExp): void;
     rejects(fn: () => Promise<unknown>, expected?: RegExp): Promise<void>;
     throws(fn: () => unknown, expected?: RegExp): void;
   };
@@ -81,6 +87,11 @@ declare module "node:fs" {
 
 declare module "node:path" {
   export function dirname(path: string): string;
+  export function join(...paths: string[]): string;
+}
+
+declare module "node:os" {
+  export function tmpdir(): string;
 }
 
 declare module "node:perf_hooks" {
