@@ -1,0 +1,91 @@
+name: Validate durable review idempotency
+
+on:
+  push:
+    branches:
+      - agent/v0.8-review-idempotency
+    paths:
+      - '.github/workflows/validate-review-idempotency.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  review-idempotency:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rxflow
+          POSTGRES_PASSWORD: rxflow
+          POSTGRES_DB: rxflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rxflow -d rxflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RXFLOW_POSTGRES_TEST_URL: postgresql://rxflow:rxflow@127.0.0.1:5432/rxflow
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+      - name: In-memory and SQLite contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          npm test
+      - name: PostgreSQL 17 concurrent review contract
+        run: node integration/postgres17-review-idempotency.mjs
+      - name: Browser retry and conflict contract
+        working-directory: web
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run check
+          npm run build
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+      - name: Record observed evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/ci-evidence
+          source_sha="$(git rev-parse HEAD)"
+          cat > docs/ci-evidence/review-idempotency.json <<JSON
+          {
+            "schemaVersion": 1,
+            "suite": "review-idempotency",
+            "observedIn": "github-actions",
+            "sourceCommit": "${source_sha}",
+            "node": "22",
+            "postgres": "17",
+            "checks": [
+              "in-memory-idempotent-review",
+              "sqlite-transactional-review-binding",
+              "postgres17-concurrent-same-key-convergence",
+              "postgres17-durable-decision-binding",
+              "conflicting-payload-rejection",
+              "chromium-review-retry-contract"
+            ],
+            "result": "passed"
+          }
+          JSON
+          rm -f .github/workflows/validate-review-idempotency.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/ci-evidence/review-idempotency.json .github/workflows/validate-review-idempotency.yml
+          git commit -m 'Record durable review idempotency evidence'
+          git push origin HEAD:agent/v0.8-review-idempotency
