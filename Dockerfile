@@ -16,4 +16,6 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/fixtures ./fixtures
 ENV PORT=8080
 EXPOSE 8080
+# The runtime image is read-only for application code and does not require root.
+USER node
 CMD ["node", "dist/src/server.js"]
