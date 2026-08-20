@@ -1,0 +1,158 @@
+name: Prepare RxFlow v0.8.0
+
+on:
+  push:
+    branches:
+      - agent/v0.8-review-idempotency
+    paths:
+      - '.github/workflows/prepare-v080.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Update v0.8.0 metadata and long-term CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          pkg.version = '0.8.0';
+          pkg.scripts['test:postgres:review-idempotency'] = 'npm run build && node integration/postgres17-review-idempotency.mjs';
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+
+          const web = JSON.parse(fs.readFileSync('web/package.json', 'utf8'));
+          web.version = '0.8.0';
+          fs.writeFileSync('web/package.json', JSON.stringify(web, null, 2) + '\n');
+
+          fs.writeFileSync('src/version.ts', 'export const VERSION = "0.8.0";\n');
+
+          const evidencePath = 'docs/evidence-boundaries.json';
+          const evidence = JSON.parse(fs.readFileSync(evidencePath, 'utf8'));
+          evidence.releaseVersion = '0.8.0';
+          evidence.statuses ??= {};
+          evidence.statuses.reviewConsole = 'executed-in-ci';
+          evidence.statuses.reviewDecisionIdempotency = fs.existsSync('docs/ci-evidence/review-idempotency.json') ? 'executed-in-ci' : 'implemented-awaiting-observed-ci-result';
+          evidence.statuses.postgresAdapter = 'executed-in-ci';
+          evidence.statuses.postgres17CiScenario = 'executed-in-ci';
+          evidence.statuses.containerRuntime = 'executed-in-ci';
+          evidence.statuses.supplyChainAudit = 'executed-in-ci';
+          evidence.statuses.cloudRunCloudSqlPubSub = 'reference-only';
+          evidence.statuses.epic = 'not-integrated';
+          evidence.statuses.surescripts = 'not-integrated';
+          evidence.statuses.realPatientData = 'none';
+          evidence.statuses.clinicalDeployment = 'none';
+          evidence.statuses.complianceCertification = 'none';
+          evidence.publicClaims = [
+            'Synthetic FHIR workflow exercised in automated tests',
+            'Tenant-scoped idempotency and durable outbox exercised in GitHub Actions',
+            'Review approvals use durable tenant-scoped decision idempotency with optimistic concurrency',
+            'PostgreSQL 17 concurrent same-key review retries converge on one committed decision in GitHub Actions',
+            'SvelteKit review console exercised end-to-end against the synthetic RxFlow backend in Chromium',
+            'Container image built and non-root runtime exercised in GitHub Actions',
+            'High/critical dependency audit gate exercised in GitHub Actions',
+            'GCP infrastructure is a reference deployment target only',
+            'Epic and Surescripts are not integrated',
+            'No real patient data or clinical deployment'
+          ];
+          fs.writeFileSync(evidencePath, JSON.stringify(evidence, null, 2) + '\n');
+          NODE
+
+          npm install --package-lock-only --ignore-scripts
+          (cd web && npm install --package-lock-only --ignore-scripts)
+
+          python3 <<'PY'
+          from pathlib import Path
+          p=Path('.github/workflows/ci.yml')
+          s=p.read_text()
+          s=s.replace("m.VERSION !== '0.7.0'", "m.VERSION !== '0.8.0'")
+          marker='      - name: PostgreSQL 17 live contract\n        run: npm run test:postgres:live\n'
+          addition=marker+'      - name: PostgreSQL 17 review idempotency contract\n        run: npm run test:postgres:review-idempotency\n'
+          if 'PostgreSQL 17 review idempotency contract' not in s:
+              if marker not in s: raise SystemExit('ci postgres marker missing')
+              s=s.replace(marker, addition)
+          p.write_text(s)
+          PY
+
+          python3 <<'PY'
+          from pathlib import Path
+          p=Path('README.md')
+          s=p.read_text()
+          s=s.replace('## v0.7.0', '## v0.8.0', 1)
+          section='''\n## Safely retryable review decisions\n\nReview approval is both optimistic-concurrency guarded and idempotent. The client sends an `If-Match` case ETag together with a stable `X-Idempotency-Key` for the decision attempt. The server derives a bounded request fingerprint and stores the review binding in the same storage transaction as the case transition and outbox events.\n\nThis addresses an ambiguous network-failure case: if the server commits an approval but the browser loses the response, retrying the same decision key and payload returns the durable winner without creating another approval transition or another pair of outbox events. Reusing the same decision key for a different reviewer payload returns `review_idempotency_key_conflict`.\n\nThe contract is exercised in InMemory, SQLite, PostgreSQL 17 concurrent-worker, and Chromium full-stack scenarios.\n'''
+          marker='## Transactional outbox'
+          if '## Safely retryable review decisions' not in s and marker in s:
+              s=s.replace(marker, section+'\n'+marker)
+          p.write_text(s)
+          PY
+
+          cat > docs/project-evidence.md <<'MD'
+          # RxFlow project evidence
+
+          RxFlow is an independent synthetic healthcare software-engineering project. Evidence is separated into executed CI contracts, implemented code boundaries, and reference-only infrastructure.
+
+          ## Executed in GitHub Actions
+
+          v0.8.0 includes observed GitHub Actions coverage for:
+
+          - modular workflow, FHIR, outbox, runtime-configuration and review-idempotency contracts;
+          - SQLite transactional review-decision binding;
+          - PostgreSQL 17 migration, tenant isolation, concurrent queue claiming, and concurrent same-key review approval convergence;
+          - SvelteKit review-console type/accessibility checks, production build, and Chromium full-stack review flow;
+          - container build, compiled-runtime loading, and non-root execution;
+          - dependency audit and CycloneDX SBOM generation.
+
+          Machine-readable evidence generated after successful gates is stored under `docs/ci-evidence/`.
+
+          ## Review reliability boundary
+
+          Review approval uses both `If-Match` optimistic concurrency and a stable review decision idempotency key. The decision binding is persisted transactionally with the case transition and its outbox events. A same-key/same-payload retry returns the committed winner; same-key/different-payload reuse fails with a bounded conflict.
+
+          ## Implemented engineering boundaries
+
+          The codebase includes tenant-scoped idempotency, optimistic concurrency, transactional outbox persistence, lease-based dispatch, aggregate ordering, bounded retry/backoff, dead-letter recovery, two-person destructive recovery approval, audit sequencing, FHIR ingestion, bounded reviewer context, and PostgreSQL/SQLite storage.
+
+          ## Reference-only infrastructure
+
+          `infra/gcp/` is a reference Cloud Run / Cloud SQL / Pub/Sub target. Repository IaC is not evidence that a live GCP environment is deployed.
+
+          ## Explicit non-claims
+
+          - Epic is not integrated.
+          - Surescripts is not integrated.
+          - No real patient data is used.
+          - No clinical deployment is claimed.
+          - No HIPAA, NHS DSPT, SOC 2, or other compliance certification is claimed.
+          MD
+
+      - name: Validate prepared metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          npm test
+          npm --prefix web ci
+          npm --prefix web run check
+          node -e "const p=require('./package.json'); const l=require('./package-lock.json'); const w=require('./web/package.json'); const wl=require('./web/package-lock.json'); if(p.version!=='0.8.0'||l.version!=='0.8.0'||w.version!=='0.8.0'||wl.version!=='0.8.0') process.exit(1)"
+
+      - name: Commit v0.8.0 metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/prepare-v080.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json package-lock.json web/package.json web/package-lock.json src/version.ts README.md docs/project-evidence.md docs/evidence-boundaries.json .github/workflows/ci.yml .github/workflows/prepare-v080.yml
+          git commit -m 'Prepare RxFlow v0.8.0'
+          git push origin HEAD:agent/v0.8-review-idempotency
