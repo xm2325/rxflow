@@ -1,0 +1,20 @@
+{
+  "resourceType": "MedicationRequest",
+  "id": "rx-demo-001",
+  "status": "active",
+  "intent": "order",
+  "subject": { "reference": "Patient/synthetic-001" },
+  "medicationCodeableConcept": {
+    "coding": [
+      {
+        "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+        "code": "12345",
+        "display": "Synthetic specialty medication"
+      }
+    ]
+  },
+  "insurance": [{ "display": "SYNTHETIC_COMMERCIAL_PLAN" }],
+  "note": [
+    { "text": "Patient had a prior therapy trial of methotrexate with inadequate response." }
+  ]
+}

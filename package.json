@@ -1,0 +1,32 @@
+{
+  "name": "rxflow",
+  "version": "0.6.0",
+  "description": "Synthetic specialty-pharmacy workflow reliability platform with FHIR ingestion, human review, and durable outbox delivery.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "test:core": "npm run build && node --test dist/test/workflow-core.test.js dist/test/fhir-contract.test.js dist/test/outbox-contract.test.js dist/test/config-contract.test.js",
+    "test:postgres:live": "npm run build && node integration/postgres17-live.mjs",
+    "check:evidence": "npm run build && node dist/src/evidence-boundaries-check.js",
+    "check:hygiene": "npm run build && node dist/src/repository-hygiene-check.js",
+    "check:operational-errors": "npm run build && node dist/src/operational-error-contract-check.js",
+    "check:infra": "npm run build && node dist/src/infra-contract-check.js",
+    "release:check": "npm run test && npm run check:evidence && npm run check:hygiene && npm run check:operational-errors && npm run check:infra",
+    "start": "node dist/src/server.js",
+    "start:worker": "node dist/src/worker-server.js",
+    "migrate:postgres": "node dist/src/migrate-postgres.js",
+    "outbox:once": "node dist/src/run-outbox-once.js",
+    "ai:eval": "node dist/src/run-ai-eval.js"
+  },
+  "dependencies": {
+    "pg": "8.16.3"
+  },
+  "devDependencies": {
+    "typescript": "5.8.3"
+  }
+}

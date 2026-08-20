@@ -1,0 +1,14 @@
+{
+  "launchUrl": "https://rxflow.synthetic.example/review?iss=https%3A%2F%2Fehr.synthetic.example%2Ffhir&launch=opaque-ehr-launch-7f10a9",
+  "tokenResponseContext": {
+    "patient": "synthetic-001",
+    "encounter": "encounter-42",
+    "scope": "launch/patient launch/encounter patient/MedicationRequest.rs patient/Patient.rs",
+    "need_patient_banner": true,
+    "intent": "prior-authorization-review",
+    "tenant": "opaque-ehr-organization-a",
+    "fhirContext": [
+      { "reference": "Task/task-msot-001" }
+    ]
+  }
+}

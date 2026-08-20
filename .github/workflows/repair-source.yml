@@ -1,0 +1,64 @@
+name: one-time-source-repair
+
+on:
+  push:
+    branches:
+      - agent/rxflow-repair
+    paths:
+      - .github/workflows/repair-source.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Materialize verified Git tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TREE: 766aa0d20f16ef3f97e8d6f275743552d423de3a
+        run: |
+          python - <<'PY'
+          import base64, json, os, pathlib, shutil, urllib.request
+          owner_repo = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['GH_TOKEN']
+          tree_sha = os.environ['TARGET_TREE']
+          api = os.environ.get('GITHUB_API_URL', 'https://api.github.com')
+          headers = {
+              'Authorization': f'Bearer {token}',
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+          }
+          def get(path):
+              req = urllib.request.Request(f'{api}{path}', headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  return json.load(r)
+          tree = get(f'/repos/{owner_repo}/git/trees/{tree_sha}?recursive=1')
+          if tree.get('truncated'):
+              raise SystemExit('target_tree_truncated')
+          wanted = {item['path']: item for item in tree['tree'] if item['type'] == 'blob'}
+          root = pathlib.Path('.')
+          for child in list(root.iterdir()):
+              if child.name == '.git':
+                  continue
+              if child.is_dir(): shutil.rmtree(child)
+              else: child.unlink()
+          for path, item in wanted.items():
+              blob = get(f"/repos/{owner_repo}/git/blobs/{item['sha']}")
+              if blob.get('encoding') != 'base64':
+                  raise SystemExit(f'unexpected_blob_encoding:{path}')
+              data = base64.b64decode(blob['content'])
+              out = root / path
+              out.parent.mkdir(parents=True, exist_ok=True)
+              out.write_bytes(data)
+          print(json.dumps({'materializedTree': tree_sha, 'files': len(wanted)}))
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Materialize verified RxFlow source tree [skip ci]"
+          git push origin HEAD:agent/rxflow-repair

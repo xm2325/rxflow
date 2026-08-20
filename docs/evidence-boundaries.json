@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "releaseVersion": "0.6.0",
+  "evidenceStatus": {
+    "syntheticFHIRWorkflow": "executed-local",
+    "sqliteProcessConcurrency": "executed-local",
+    "postgresAdapter": "implemented-not-live-here",
+    "postgres17CiScenario": "implemented-awaiting-observed-ci-result",
+    "cloudRunCloudSqlPubSub": "reference-only",
+    "epic": "not-integrated",
+    "surescripts": "not-integrated",
+    "realPatientData": "none",
+    "clinicalDeployment": "none",
+    "complianceCertification": "none",
+    "typescriptBuildTool": "locked-dev-dependency"
+  },
+  "forbiddenPositiveClaims": [
+    "deployed to GCP",
+    "deployed on GCP",
+    "production PostgreSQL",
+    "live PostgreSQL verified",
+    "Cloud SQL deployed",
+    "Epic integration",
+    "Surescripts integration",
+    "HIPAA compliant",
+    "HIPAA-compliant",
+    "real patient data",
+    "clinical deployment"
+  ],
+  "publicClaims": [
+    "Synthetic FHIR workflow implemented and exercised in automated tests",
+    "Tenant-scoped idempotency and durable outbox contracts exercised in GitHub Actions",
+    "GCP infrastructure is a reference deployment target only",
+    "Epic and Surescripts are not integrated",
+    "No real patient data or clinical deployment"
+  ],
+  "statuses": {
+    "postgresAdapter": "implemented-not-live-here",
+    "postgres17CiScenario": "implemented-awaiting-observed-ci-result",
+    "containerRuntime": "implemented-awaiting-observed-ci-result",
+    "supplyChainAudit": "implemented-awaiting-observed-ci-result",
+    "cloudRunCloudSqlPubSub": "reference-only",
+    "epic": "not-integrated",
+    "surescripts": "not-integrated",
+    "realPatientData": "none",
+    "clinicalDeployment": "none",
+    "complianceCertification": "none"
+  }
+}

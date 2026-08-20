@@ -1,0 +1,11 @@
+.git
+.github
+node_modules
+dist
+artifacts
+.data
+.env
+*.zip
+*.tgz
+docs/run-report-v*.md
+docs/release-evidence-v*.json
