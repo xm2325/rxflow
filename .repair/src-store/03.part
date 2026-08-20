@@ -1,0 +1,237 @@
+interface SqliteRetirementRequestRow { request_id: string; tenant_id: string; event_id: string; recovery_generation: number; requested_by: string; reason_code: string; reference: string; status: OutboxRecoveryRequestStatus; requested_at: string; approved_by: string | null; approved_at: string | null; replacement_event_id: string | null; superseded_by: string | null; superseded_at: string | null; }
+interface SqliteRecoveryAuditRow { audit_id: string; audit_sequence: number; tenant_id: string; event_id: string; recovery_generation: number; action: OutboxRecoveryAuditAction; actor_id: string; created_at: string; request_id: string | null; reason_code: string | null; reference: string | null; replacement_event_id: string | null; }
+
+export class SqliteCaseStore implements CaseStore {
+  private readonly db: DatabaseSync;
+
+  constructor(filePath: string) {
+    this.db = new DatabaseSync(filePath);
+    this.db.exec("PRAGMA foreign_keys = ON");
+    this.db.exec("PRAGMA busy_timeout = 5000");
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS cases (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        case_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS idempotency (
+        key TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        case_id TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        PRIMARY KEY(tenant_id, key),
+        FOREIGN KEY(case_id) REFERENCES cases(id) ON DELETE CASCADE
+      );
+    `);
+    this.ensureOutboxSchema();
+    this.ensureOutboxAgeSchema();
+    this.ensureTenantSchema();
+    this.ensureOutboxAggregateSchema();
+    this.ensureOutboxRetirementSchema();
+    this.ensureOutboxRecoveryGenerationSchema();
+    this.ensureCompositeIdempotencySchema();
+    this.ensureOutboxRecoveryApprovalSchema();
+    this.ensureRecoveryAuditSequenceSchema();
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  get(id: string, tenantId?: string): RxCase | undefined {
+    const row = tenantId === undefined
+      ? this.db.prepare("SELECT case_json FROM cases WHERE id = ?").get(id) as SqliteCaseRow | undefined
+      : this.db.prepare("SELECT case_json FROM cases WHERE id = ? AND tenant_id = ?").get(id, tenantId) as SqliteCaseRow | undefined;
+    return row ? normalizeCaseVersion(JSON.parse(row.case_json) as RxCase) : undefined;
+  }
+
+  list(tenantId?: string): RxCase[] {
+    const rows = (tenantId === undefined
+      ? this.db.prepare("SELECT case_json FROM cases ORDER BY rowid").all()
+      : this.db.prepare("SELECT case_json FROM cases WHERE tenant_id = ? ORDER BY rowid").all(tenantId)) as SqliteCaseRow[];
+    return rows.map((row) => normalizeCaseVersion(JSON.parse(row.case_json) as RxCase));
+  }
+
+  save(rxCase: RxCase): void {
+    this.transaction(() => this.upsertCase(rxCase));
+  }
+
+  createCase(rxCase: RxCase, idempotencyKey: string, requestFingerprint: string, events: IntegrationEvent[] = []): void {
+    this.transaction(() => {
+      const tenantId = caseTenant(rxCase);
+      const existing = this.db.prepare("SELECT key FROM idempotency WHERE tenant_id = ? AND key = ?").get(tenantId, idempotencyKey) as { key: string } | undefined;
+      if (existing) throw new IdempotencyKeyAlreadyBoundError();
+      this.db.prepare("INSERT INTO cases(id, tenant_id, case_json) VALUES (?, ?, ?)").run(rxCase.id, caseTenant(rxCase), JSON.stringify(rxCase));
+      this.db.prepare("INSERT INTO idempotency(key, tenant_id, case_id, request_fingerprint) VALUES (?, ?, ?, ?)")
+        .run(idempotencyKey, tenantId, rxCase.id, requestFingerprint);
+      this.insertEvents(events);
+    });
+  }
+
+  saveWithOutbox(rxCase: RxCase, events: IntegrationEvent[]): void {
+    this.transaction(() => {
+      this.upsertCase(rxCase);
+      this.insertEvents(events);
+    });
+  }
+
+  saveWithOutboxIfStatus(rxCase: RxCase, expectedStatus: WorkflowStatus, events: IntegrationEvent[]): boolean {
+    let saved = false;
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT case_json FROM cases WHERE id = ?").get(rxCase.id) as SqliteCaseRow | undefined;
+      if (!row) return;
+      const current = normalizeCaseVersion(JSON.parse(row.case_json) as RxCase);
+      if (current.status !== expectedStatus) return;
+      this.upsertCase(rxCase);
+      this.insertEvents(events);
+      saved = true;
+    });
+    return saved;
+  }
+
+  saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[]): boolean {
+    if (rxCase.version !== expectedVersion + 1) throw new Error("invalid_case_version_transition");
+    let saved = false;
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT case_json FROM cases WHERE id = ?").get(rxCase.id) as SqliteCaseRow | undefined;
+      if (!row) return;
+      const current = normalizeCaseVersion(JSON.parse(row.case_json) as RxCase);
+      if (current.version !== expectedVersion) return;
+      this.upsertCase(rxCase);
+      this.insertEvents(events);
+      saved = true;
+    });
+    return saved;
+  }
+
+  getByIdempotencyKey(key: string, tenantId = "default"): IdempotencyLookup | undefined {
+    const row = this.db.prepare(`
+      SELECT c.case_json AS case_json, i.request_fingerprint AS request_fingerprint
+      FROM idempotency i
+      JOIN cases c ON c.id = i.case_id AND c.tenant_id = i.tenant_id
+      WHERE i.key = ? AND i.tenant_id = ?
+    `).get(key, tenantId) as SqliteIdempotencyRow | undefined;
+    if (!row) return undefined;
+    const rxCase = normalizeCaseVersion(JSON.parse(row.case_json) as RxCase);
+    if (tenantId !== undefined && caseTenant(rxCase) !== tenantId) return undefined;
+    return { case: rxCase, requestFingerprint: row.request_fingerprint };
+  }
+
+  bindIdempotencyKey(key: string, caseId: string, requestFingerprint: string, tenantId = "default"): void {
+    this.transaction(() => {
+      const caseRow = this.db.prepare("SELECT case_json FROM cases WHERE id = ? AND tenant_id = ?").get(caseId, tenantId) as SqliteCaseRow | undefined;
+      if (!caseRow) throw new Error("case_not_found");
+      const existing = this.db.prepare("SELECT case_id, request_fingerprint FROM idempotency WHERE key = ? AND tenant_id = ?").get(key, tenantId) as { case_id: string; request_fingerprint: string } | undefined;
+      if (existing && (existing.case_id !== caseId || existing.request_fingerprint !== requestFingerprint)) {
+        throw new IdempotencyKeyAlreadyBoundError();
+      }
+      if (!existing) {
+        this.db.prepare("INSERT INTO idempotency(key, tenant_id, case_id, request_fingerprint) VALUES (?, ?, ?, ?)")
+          .run(key, tenantId, caseId, requestFingerprint);
+      }
+    });
+  }
+
+  listOutbox(status?: OutboxStatus, tenantId?: string): OutboxRecord[] {
+    const columns = "event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until, next_attempt_at, created_at, retired_at, retired_by, retirement_reason_code, retirement_reference, replacement_event_id, recovery_generation";
+    let rows: SqliteOutboxRow[];
+    if (status !== undefined && tenantId !== undefined) {
+      rows = this.db.prepare(`SELECT ${columns} FROM outbox WHERE status = ? AND tenant_id = ? ORDER BY rowid`).all(status, tenantId) as SqliteOutboxRow[];
+    } else if (status !== undefined) {
+      rows = this.db.prepare(`SELECT ${columns} FROM outbox WHERE status = ? ORDER BY rowid`).all(status) as SqliteOutboxRow[];
+    } else if (tenantId !== undefined) {
+      rows = this.db.prepare(`SELECT ${columns} FROM outbox WHERE tenant_id = ? ORDER BY rowid`).all(tenantId) as SqliteOutboxRow[];
+    } else {
+      rows = this.db.prepare(`SELECT ${columns} FROM outbox ORDER BY rowid`).all() as SqliteOutboxRow[];
+    }
+    return rows.map((row) => this.mapOutboxRow(row));
+  }
+
+  claimOutbox(workerId: string, limit: number, leaseMs: number, now = new Date(), perTenantLimit = limit): ClaimedOutboxRecord[] {
+    if (limit < 1) return [];
+    if (leaseMs < 1) throw new Error("outbox_lease_must_be_positive");
+    if (!Number.isInteger(perTenantLimit) || perTenantLimit < 1) throw new Error("outbox_per_tenant_limit_must_be_positive");
+    const nowIso = now.toISOString();
+    const leaseUntil = new Date(now.getTime() + leaseMs).toISOString();
+    const claims: ClaimedOutboxRecord[] = [];
+
+    this.transaction(() => {
+      this.db.prepare(`
+        UPDATE outbox
+        SET status = 'PENDING', claim_id = NULL, claimed_by = NULL, lease_until = NULL, next_attempt_at = NULL
+        WHERE status = 'IN_FLIGHT' AND lease_until <= ?
+      `).run(nowIso);
+
+      const rows = this.db.prepare(`
+        WITH eligible_heads AS (
+          SELECT o.rowid AS queue_order, o.event_json, o.status, o.attempts, o.last_error, o.published_at,
+                 o.claim_id, o.claimed_by, o.lease_until, o.next_attempt_at, o.created_at, o.retired_at, o.retired_by, o.retirement_reason_code, o.retirement_reference, o.replacement_event_id, o.recovery_generation, o.tenant_id
+          FROM outbox AS o
+          WHERE o.status = 'PENDING'
+            AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
+            AND (
+              o.aggregate_sequence IS NULL
+              OR NOT EXISTS (
+                SELECT 1
+                FROM outbox AS predecessor
+                WHERE predecessor.tenant_id = o.tenant_id
+                  AND predecessor.aggregate_case_id = o.aggregate_case_id
+                  AND predecessor.aggregate_sequence < o.aggregate_sequence
+                  AND predecessor.status NOT IN ('PUBLISHED','RETIRED')
+              )
+            )
+        ),
+        eligible AS (
+          SELECT *, ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY queue_order) AS tenant_rank
+          FROM eligible_heads
+        )
+        SELECT event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until, next_attempt_at, created_at, retired_at, retired_by, retirement_reason_code, retirement_reference, replacement_event_id, recovery_generation
+        FROM eligible
+        WHERE tenant_rank <= ?
+        ORDER BY tenant_rank, queue_order
+        LIMIT ?
+      `).all(nowIso, perTenantLimit, limit) as SqliteOutboxRow[];
+
+      const claimStatement = this.db.prepare(`
+        UPDATE outbox
+        SET status = 'IN_FLIGHT', claim_id = ?, claimed_by = ?, lease_until = ?
+        WHERE event_id = ? AND status = 'PENDING'
+      `);
+      for (const row of rows) {
+        const event = JSON.parse(row.event_json) as IntegrationEvent;
+        const claimId = randomUUID();
+        const result = claimStatement.run(claimId, workerId, leaseUntil, event.eventId);
+        if (result.changes !== 1) continue;
+        claims.push({
+          ...this.mapOutboxRow(row),
+          status: "IN_FLIGHT",
+          claimId,
+          claimedBy: workerId,
+          leaseUntil
+        } as ClaimedOutboxRecord);
+      }
+    });
+    return claims;
+  }
+
+  renewOutboxLease(eventId: string, claimId: string, leaseMs: number, now = new Date()): void {
+    if (leaseMs < 1) throw new Error("outbox_lease_must_be_positive");
+    const leaseUntil = new Date(now.getTime() + leaseMs).toISOString();
+    const result = this.db.prepare(`
+      UPDATE outbox
+      SET lease_until = ?
+      WHERE event_id = ? AND status = 'IN_FLIGHT' AND claim_id = ?
+    `).run(leaseUntil, eventId, claimId);
+    if (result.changes !== 1) throw new Error("stale_outbox_claim");
+  }
+
+  deferOutboxClaim(eventId: string, claimId: string, retryDelayMs = 0, now = new Date()): void {
+    if (retryDelayMs < 0) throw new Error("invalid_outbox_retry_delay");
+    const nextAttemptAt = retryDelayMs > 0 ? new Date(now.getTime() + retryDelayMs).toISOString() : null;
+    const result = this.db.prepare(`
+      UPDATE outbox
+      SET status = 'PENDING', claim_id = NULL, claimed_by = NULL, lease_until = NULL, next_attempt_at = ?
+      WHERE event_id = ? AND status = 'IN_FLIGHT' AND claim_id = ?
+    `).run(nextAttemptAt, eventId, claimId);
+    if (result.changes !== 1) throw new Error("stale_outbox_claim");
