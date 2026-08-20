@@ -1,6 +1,6 @@
 {
   "name": "rxflow",
-  "version": "0.6.0",
+  "version": "0.9.0",
   "description": "Synthetic specialty-pharmacy workflow reliability platform with FHIR ingestion, human review, and durable outbox delivery.",
   "type": "module",
   "private": true,
