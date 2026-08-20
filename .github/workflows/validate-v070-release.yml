@@ -1,0 +1,152 @@
+name: Validate RxFlow v0.7.0 release
+
+on:
+  push:
+    branches:
+      - agent/v0.7-review-console
+    paths:
+      - '.github/workflows/validate-v070-release.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  release-candidate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rxflow
+          POSTGRES_PASSWORD: rxflow
+          POSTGRES_DB: rxflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rxflow -d rxflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RXFLOW_POSTGRES_TEST_URL: postgresql://rxflow:rxflow@127.0.0.1:5432/rxflow
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - name: Root release contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run release:check
+          npm run test:postgres:live
+
+      - name: Container runtime contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull -t rxflow-v070:${GITHUB_SHA} .
+          docker run --rm rxflow-v070:${GITHUB_SHA} node --input-type=module -e "import('./dist/src/version.js').then(m => { if (m.VERSION !== '0.7.0') process.exit(2); })"
+          docker run --rm rxflow-v070:${GITHUB_SHA} node -e "if (typeof process.getuid === 'function' && process.getuid() === 0) process.exit(1)"
+
+      - name: Review console contract
+        working-directory: web
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run check
+          npm run build
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+
+      - name: Supply-chain contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm audit --json > /tmp/root-audit.json || true
+          (cd web && npm audit --json > /tmp/web-audit.json || true)
+          node <<'NODE'
+          const fs = require('fs');
+          for (const [name, path] of [['root','/tmp/root-audit.json'], ['web','/tmp/web-audit.json']]) {
+            const report = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const v = report.metadata?.vulnerabilities ?? {};
+            const high = Number(v.high ?? 0);
+            const critical = Number(v.critical ?? 0);
+            console.log(JSON.stringify({ name, high, critical }));
+            if (high > 0 || critical > 0) process.exit(1);
+          }
+          NODE
+          npm sbom --sbom-format=cyclonedx > /tmp/root-sbom.cdx.json
+          (cd web && npm sbom --sbom-format=cyclonedx > /tmp/web-sbom.cdx.json)
+
+      - name: Repository surface contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f README.md
+          test -f package-lock.json
+          test -f web/package-lock.json
+          test -f web/src/routes/+page.svelte
+          test -f web/src/routes/api/'[...path]'/+server.ts
+          test -f .github/workflows/ci.yml
+          test -f .github/workflows/review-console.yml
+          test ! -e .repair
+          test ! -e .rxflow-import
+          test ! -e .rxflow-import-xz
+          test ! -e .rxflow-import-safe
+          test ! -e .rxflow-import-final
+          test ! -e .upload-marker
+
+      - name: Record validated release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/ci-evidence
+          source_sha="$(git rev-parse HEAD)"
+          node <<NODE
+          const fs = require('fs');
+          const web = JSON.parse(fs.readFileSync('web/package.json', 'utf8'));
+          const audit = p => {
+            const r = JSON.parse(fs.readFileSync(p, 'utf8'));
+            const v = r.metadata?.vulnerabilities ?? {};
+            return { high: Number(v.high ?? 0), critical: Number(v.critical ?? 0) };
+          };
+          fs.writeFileSync('docs/ci-evidence/v0.7.0-release.json', JSON.stringify({
+            schemaVersion: 1,
+            releaseVersion: '0.7.0',
+            observedIn: 'github-actions',
+            sourceCommit: '${source_sha}',
+            node: '22',
+            postgres: '17',
+            reviewConsole: { framework: 'SvelteKit', versions: web.devDependencies },
+            checks: [
+              'release-contract',
+              'postgres17-live',
+              'container-build',
+              'container-non-root',
+              'svelte-check',
+              'review-console-production-build',
+              'chromium-full-stack-e2e',
+              'root-dependency-audit',
+              'web-dependency-audit'
+            ],
+            dependencyAudit: { root: audit('/tmp/root-audit.json'), web: audit('/tmp/web-audit.json') },
+            result: 'passed'
+          }, null, 2) + '\n');
+          NODE
+          cp /tmp/root-sbom.cdx.json docs/ci-evidence/root-sbom.cdx.json
+          cp /tmp/web-sbom.cdx.json docs/ci-evidence/web-sbom.cdx.json
+          rm -f .github/workflows/validate-v070-release.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/ci-evidence .github/workflows/validate-v070-release.yml
+          git commit -m 'Record validated v0.7.0 release candidate'
+          git push origin HEAD:agent/v0.7-review-console

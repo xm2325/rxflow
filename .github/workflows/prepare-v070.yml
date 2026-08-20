@@ -1,0 +1,140 @@
+name: Prepare RxFlow v0.7.0
+
+on:
+  push:
+    branches:
+      - agent/v0.7-review-console
+    paths:
+      - '.github/workflows/prepare-v070.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Update release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          pkg.version = '0.7.0';
+          pkg.scripts['web:check'] = 'npm --prefix web run check';
+          pkg.scripts['web:test:e2e'] = 'npm --prefix web run test:e2e';
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+
+          fs.writeFileSync('src/version.ts', 'export const VERSION = "0.7.0";\n');
+
+          const evidencePath = 'docs/evidence-boundaries.json';
+          const evidence = JSON.parse(fs.readFileSync(evidencePath, 'utf8'));
+          evidence.releaseVersion = '0.7.0';
+          evidence.statuses ??= {};
+          evidence.statuses.reviewConsole = fs.existsSync('docs/ci-evidence/review-console.json') ? 'executed-in-ci' : 'implemented-awaiting-observed-ci-result';
+          evidence.statuses.postgresAdapter = 'executed-in-ci';
+          evidence.statuses.postgres17CiScenario = 'executed-in-ci';
+          evidence.statuses.containerRuntime = 'executed-in-ci';
+          evidence.statuses.supplyChainAudit = 'executed-in-ci';
+          evidence.statuses.cloudRunCloudSqlPubSub = 'reference-only';
+          evidence.statuses.epic = 'not-integrated';
+          evidence.statuses.surescripts = 'not-integrated';
+          evidence.statuses.realPatientData = 'none';
+          evidence.statuses.clinicalDeployment = 'none';
+          evidence.statuses.complianceCertification = 'none';
+          evidence.publicClaims = [
+            'Synthetic FHIR workflow exercised in automated tests',
+            'Tenant-scoped idempotency and durable outbox exercised in GitHub Actions',
+            'PostgreSQL 17 adapter and schema exercised in GitHub Actions',
+            'Container image built and non-root runtime exercised in GitHub Actions',
+            'SvelteKit review console exercised end-to-end against the synthetic RxFlow backend in Chromium',
+            'High/critical dependency audit gate exercised in GitHub Actions',
+            'GCP infrastructure is a reference deployment target only',
+            'Epic and Surescripts are not integrated',
+            'No real patient data or clinical deployment'
+          ];
+          fs.writeFileSync(evidencePath, JSON.stringify(evidence, null, 2) + '\n');
+          NODE
+
+          npm install --package-lock-only --ignore-scripts
+
+          python3 <<'PY'
+          from pathlib import Path
+          p=Path('.github/workflows/ci.yml')
+          s=p.read_text()
+          s=s.replace("m.VERSION !== '0.6.0'", "m.VERSION !== '0.7.0'")
+          p.write_text(s)
+          PY
+
+          python3 <<'PY'
+          from pathlib import Path
+          p=Path('README.md')
+          s=p.read_text()
+          s=s.replace('## v0.6.0', '## v0.7.0', 1)
+          section='''\n## Synthetic review console\n\n`web/` contains a SvelteKit human-review surface backed by a bounded same-origin proxy. The browser does not receive a configurable arbitrary backend URL: the proxy allow-list is limited to work-queue, review-context, and approval routes.\n\nThe console keeps the synthetic reviewer token in page memory, preserves the backend ETag for optimistic concurrency, supports reviewer edits, and clears the decision guard when a stale `412` response is observed.\n\n```bash\n# terminal 1: API\nRXFLOW_REVIEW_BEARER_TOKEN=synthetic-review-token-0000000000001 \\\nRXFLOW_REVIEW_PRINCIPAL=synthetic-reviewer \\\nnpm run build && npm start\n\n# terminal 2: review console\ncd web\nnpm ci\nRXFLOW_API_BASE=http://127.0.0.1:8080 npm run dev\n```\n\nThe Playwright suite starts both services, seeds a synthetic FHIR case, loads its review context through the proxy, and commits an approval using the real backend `If-Match` contract.\n'''
+          marker='## Repository layout'
+          if '## Synthetic review console' not in s and marker in s:
+              s=s.replace(marker, section+'\n'+marker)
+          p.write_text(s)
+          PY
+
+          cat > docs/project-evidence.md <<'MD'
+          # RxFlow project evidence
+
+          RxFlow is an independent synthetic healthcare software-engineering project. Evidence is separated into executed CI contracts, implemented code boundaries, and reference-only infrastructure.
+
+          ## Executed in GitHub Actions
+
+          v0.7.0 includes observed GitHub Actions coverage for:
+
+          - modular workflow, FHIR, outbox and runtime-configuration contracts;
+          - PostgreSQL 17 migration, idempotent replay, tenant isolation and concurrent queue claiming;
+          - container build, compiled-runtime loading and non-root execution;
+          - SvelteKit review-console checks, production build and Chromium full-stack end-to-end review flow;
+          - dependency audit and CycloneDX SBOM generation.
+
+          Machine-readable evidence generated by successful one-shot validation gates is stored in `docs/ci-evidence/`.
+
+          ## Implemented engineering boundaries
+
+          The codebase includes tenant-scoped idempotency, optimistic concurrency, transactional outbox persistence, lease-based dispatch, aggregate ordering, bounded retry/backoff, dead-letter recovery, two-person destructive recovery approval, audit sequencing, FHIR ingestion, reviewer context isolation, and PostgreSQL/SQLite storage.
+
+          The review console uses a same-origin SvelteKit proxy with an explicit route allow-list. It forwards only the headers required by the review contract and maps proxy transport failure to a bounded error.
+
+          ## Reference-only infrastructure
+
+          `infra/gcp/` is a reference Cloud Run / Cloud SQL / Pub/Sub target. Repository IaC is not evidence that a live GCP environment is deployed.
+
+          ## Explicit non-claims
+
+          - Epic is not integrated.
+          - Surescripts is not integrated.
+          - No real patient data is used.
+          - No clinical deployment is claimed.
+          - No HIPAA, NHS DSPT, SOC 2, or other compliance certification is claimed.
+          MD
+
+      - name: Validate package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          npm run test:core
+          node -e "const p=require('./package.json'); const l=require('./package-lock.json'); if(p.version!=='0.7.0'||l.version!=='0.7.0') process.exit(1)"
+
+      - name: Commit v0.7.0 metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/prepare-v070.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json package-lock.json src/version.ts README.md docs/project-evidence.md docs/evidence-boundaries.json .github/workflows/ci.yml .github/workflows/prepare-v070.yml
+          git commit -m 'Prepare RxFlow v0.7.0'
+          git push origin HEAD:agent/v0.7-review-console
