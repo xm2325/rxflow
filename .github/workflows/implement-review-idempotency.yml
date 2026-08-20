@@ -1,0 +1,146 @@
+name: Implement durable review idempotency
+
+on:
+  push:
+    branches:
+      - agent/v0.8-review-idempotency
+    paths:
+      - '.github/workflows/implement-review-idempotency.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  implement-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - name: Patch durable review-idempotency contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          def require_replace(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected 1 occurrence, found {count}')
+              return text.replace(old, new)
+
+          # ---- store contract + in-memory / JSON / SQLite ----
+          p = Path('src/store.ts')
+          s = p.read_text()
+          s = require_replace(s,
+          '''export interface IdempotencyLookup {\n  case: RxCase;\n  requestFingerprint: string;\n}\n''',
+          '''export interface IdempotencyLookup {\n  case: RxCase;\n  requestFingerprint: string;\n}\n\nexport interface IdempotencyBinding {\n  key: string;\n  requestFingerprint: string;\n}\n''', 'idempotency binding interface')
+          s = require_replace(s,
+          '  saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[]): Awaitable<boolean>;\n',
+          '  saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[], idempotencyBinding?: IdempotencyBinding): Awaitable<boolean>;\n',
+          'store interface signature')
+
+          old = '''  saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[]): boolean {\n    const current = this.cases.get(rxCase.id);\n    if (!current || normalizeCaseVersion(current).version !== expectedVersion) return false;\n    if (rxCase.version !== expectedVersion + 1) throw new Error("invalid_case_version_transition");\n    this.cases.set(rxCase.id, cloneCase(rxCase));\n    this.enqueue(events);\n    return true;\n  }\n'''
+          new = '''  saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[], idempotencyBinding?: IdempotencyBinding): boolean {\n    const current = this.cases.get(rxCase.id);\n    if (!current || normalizeCaseVersion(current).version !== expectedVersion) return false;\n    if (rxCase.version !== expectedVersion + 1) throw new Error("invalid_case_version_transition");\n    const storageKey = idempotencyBinding ? idempotencyStorageKey(caseTenant(rxCase), idempotencyBinding.key) : undefined;\n    const existing = storageKey ? this.idempotency.get(storageKey) : undefined;\n    if (existing && (existing.caseId !== rxCase.id || existing.requestFingerprint !== idempotencyBinding?.requestFingerprint)) {\n      throw new IdempotencyKeyAlreadyBoundError();\n    }\n    for (const event of events) if (this.outbox.has(event.eventId)) throw new Error("outbox_event_already_exists");\n    this.cases.set(rxCase.id, cloneCase(rxCase));\n    this.enqueue(events);\n    if (storageKey && idempotencyBinding && !existing) {\n      this.idempotency.set(storageKey, { caseId: rxCase.id, requestFingerprint: idempotencyBinding.requestFingerprint });\n    }\n    return true;\n  }\n'''
+          s = require_replace(s, old, new, 'in-memory versioned save')
+
+          s = require_replace(s,
+          '  override saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[]): boolean {\n    const saved = super.saveWithOutboxIfVersion(rxCase, expectedVersion, events);\n',
+          '  override saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[], idempotencyBinding?: IdempotencyBinding): boolean {\n    const saved = super.saveWithOutboxIfVersion(rxCase, expectedVersion, events, idempotencyBinding);\n',
+          'json versioned save')
+
+          sqlite_old = '''  saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[]): boolean {\n    if (rxCase.version !== expectedVersion + 1) throw new Error("invalid_case_version_transition");\n    let saved = false;\n    this.transaction(() => {\n      const row = this.db.prepare("SELECT case_json FROM cases WHERE id = ?").get(rxCase.id) as SqliteCaseRow | undefined;\n      if (!row) return;\n      const current = normalizeCaseVersion(JSON.parse(row.case_json) as RxCase);\n      if (current.version !== expectedVersion) return;\n      this.upsertCase(rxCase);\n      this.insertEvents(events);\n      saved = true;\n    });\n    return saved;\n  }\n'''
+          sqlite_new = '''  saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[], idempotencyBinding?: IdempotencyBinding): boolean {\n    if (rxCase.version !== expectedVersion + 1) throw new Error("invalid_case_version_transition");\n    let saved = false;\n    this.transaction(() => {\n      const row = this.db.prepare("SELECT case_json FROM cases WHERE id = ?").get(rxCase.id) as SqliteCaseRow | undefined;\n      if (!row) return;\n      const current = normalizeCaseVersion(JSON.parse(row.case_json) as RxCase);\n      if (current.version !== expectedVersion) return;\n      const tenantId = caseTenant(rxCase);\n      const existing = idempotencyBinding\n        ? this.db.prepare("SELECT case_id, request_fingerprint FROM idempotency WHERE key = ? AND tenant_id = ?").get(idempotencyBinding.key, tenantId) as { case_id: string; request_fingerprint: string } | undefined\n        : undefined;\n      if (existing && (existing.case_id !== rxCase.id || existing.request_fingerprint !== idempotencyBinding?.requestFingerprint)) {\n        throw new IdempotencyKeyAlreadyBoundError();\n      }\n      this.upsertCase(rxCase);\n      this.insertEvents(events);\n      if (idempotencyBinding && !existing) {\n        this.db.prepare("INSERT INTO idempotency(key, tenant_id, case_id, request_fingerprint) VALUES (?, ?, ?, ?)")\n          .run(idempotencyBinding.key, tenantId, rxCase.id, idempotencyBinding.requestFingerprint);\n      }\n      saved = true;\n    });\n    return saved;\n  }\n'''
+          s = require_replace(s, sqlite_old, sqlite_new, 'sqlite versioned save')
+          p.write_text(s)
+
+          # ---- PostgreSQL transaction ----
+          p = Path('src/postgres-store.ts')
+          s = p.read_text()
+          s = require_replace(s,
+          'import { IdempotencyKeyAlreadyBoundError, type CaseStore, type IdempotencyLookup, type OutboxCounts,',
+          'import { IdempotencyKeyAlreadyBoundError, type CaseStore, type IdempotencyBinding, type IdempotencyLookup, type OutboxCounts,',
+          'postgres binding import')
+          pg_old = '''  async saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[]): Promise<boolean> {\n    if (rxCase.version !== expectedVersion + 1) throw new Error("invalid_case_version_transition");\n    return await this.withConditionalTransaction(async (client) => {\n      const updated = await client.query<{ id: string }>(`\n        UPDATE cases\n        SET version = $4, status = $5, case_json = $6::jsonb, updated_at = NOW()\n        WHERE id = $1 AND tenant_id = $2 AND version = $3\n        RETURNING id\n      `, [rxCase.id, caseTenantId(rxCase), expectedVersion, rxCase.version, rxCase.status, JSON.stringify(rxCase)]);\n      if (updated.rows.length !== 1) return false;\n      await this.insertEvents(client, events);\n      return true;\n    });\n  }\n'''
+          pg_new = '''  async saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[], idempotencyBinding?: IdempotencyBinding): Promise<boolean> {\n    if (rxCase.version !== expectedVersion + 1) throw new Error("invalid_case_version_transition");\n    return await this.withConditionalTransaction(async (client) => {\n      const tenantId = caseTenantId(rxCase);\n      const updated = await client.query<{ id: string }>(`\n        UPDATE cases\n        SET version = $4, status = $5, case_json = $6::jsonb, updated_at = NOW()\n        WHERE id = $1 AND tenant_id = $2 AND version = $3\n        RETURNING id\n      `, [rxCase.id, tenantId, expectedVersion, rxCase.version, rxCase.status, JSON.stringify(rxCase)]);\n      if (updated.rows.length !== 1) return false;\n      await this.insertEvents(client, events);\n      if (idempotencyBinding) {\n        await client.query(`\n          INSERT INTO idempotency(key, tenant_id, case_id, request_fingerprint)\n          VALUES ($1, $2, $3, $4)\n          ON CONFLICT (tenant_id, key) DO NOTHING\n        `, [idempotencyBinding.key, tenantId, rxCase.id, idempotencyBinding.requestFingerprint]);\n        const binding = await client.query<{ case_id: string; request_fingerprint: string }>(\n          "SELECT case_id, request_fingerprint FROM idempotency WHERE key = $1 AND tenant_id = $2",\n          [idempotencyBinding.key, tenantId]\n        );\n        const existing = binding.rows[0];\n        if (!existing || existing.case_id !== rxCase.id || existing.request_fingerprint !== idempotencyBinding.requestFingerprint) {\n          throw new IdempotencyKeyAlreadyBoundError();\n        }\n      }\n      return true;\n    });\n  }\n'''
+          s = require_replace(s, pg_old, pg_new, 'postgres versioned save')
+          p.write_text(s)
+
+          # ---- Workflow decision semantics ----
+          p = Path('src/workflow.ts')
+          s = p.read_text()
+          match = re.search(r'  async approve\(caseId: string, reviewer: string, expectedVersion: number, finalAnswer\?: string, tenantIdInput\?: string\): Promise<RxCase> \{.*?\n  \}\n\n  async get\(', s, re.S)
+          if not match:
+              raise SystemExit('workflow approve method not found')
+          replacement = '''  async approve(caseId: string, reviewer: string, expectedVersion: number, finalAnswer?: string, tenantIdInput?: string, reviewIdempotencyKey?: string): Promise<RxCase> {\n    const tenantId = normalizedTenantId(tenantIdInput);\n    const current = await this.store.get(caseId, tenantId);\n    if (!current || caseTenantId(current) !== tenantId) throw new AppError("case_not_found", 404, false, "Case not found.");\n    if (!current.paDraft) throw new AppError("missing_pa_draft", 409, false, "No PA draft is available for review.");\n    if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {\n      throw new AppError("invalid_review_version", 400, false, "A valid reviewed case version is required.");\n    }\n    const decisionKey = reviewIdempotencyKey?.trim();\n    if (!decisionKey || decisionKey.length < 8 || decisionKey.length > 200) {\n      throw new AppError("review_idempotency_key_required", 400, false, "A stable review decision idempotency key is required.");\n    }\n\n    let reviewedAnswer = current.paDraft.answer;\n    if (finalAnswer !== undefined) {\n      if (typeof finalAnswer !== "string" || finalAnswer.trim() === "") {\n        throw new AppError("invalid_review_answer", 400, false, "A reviewer answer, when supplied, must be a non-empty string.");\n      }\n      if (finalAnswer.length > 4000) {\n        throw new AppError("review_answer_too_large", 413, false, "Reviewer answer exceeds the 4,000 character limit.");\n      }\n      reviewedAnswer = finalAnswer.trim();\n    }\n\n    const reviewBindingKey = `review:${decisionKey}`;\n    const reviewFingerprint = createHash("sha256").update(JSON.stringify({\n      caseId, reviewer, expectedVersion, finalAnswer: reviewedAnswer\n    })).digest("hex");\n    const existingDecision = await this.store.getByIdempotencyKey(reviewBindingKey, tenantId);\n    if (existingDecision) {\n      if (existingDecision.case.id !== caseId || existingDecision.requestFingerprint !== reviewFingerprint) {\n        this.metrics.increment("review_idempotency_conflicts_total");\n        throw new AppError("review_idempotency_key_conflict", 409, false, "The review decision key was already used for a different decision.");\n      }\n      this.metrics.increment("review_idempotent_replays_total");\n      return existingDecision.case;\n    }\n\n    if (current.status !== "HUMAN_REVIEW_REQUIRED") throw new AppError("case_not_reviewable", 409, false, "The case is not waiting for human review.");\n    if (current.version !== expectedVersion) {\n      this.metrics.increment("stale_review_decisions_total");\n      throw new AppError("stale_review", 412, false, "The case changed after it was reviewed. Reload the case before deciding again.");\n    }\n\n    const rxCase = JSON.parse(JSON.stringify(current)) as RxCase;\n    const edited = reviewedAnswer !== current.paDraft.answer;\n    const reviewedAt = new Date().toISOString();\n    rxCase.reviewDecision = { reviewer, edited, finalAnswer: reviewedAnswer, reviewedAt };\n    if (edited) audit(rxCase, "pa_draft_edited_by_reviewer", { reviewer, answerChars: reviewedAnswer.length });\n    rxCase.status = "PA_APPROVED";\n    audit(rxCase, "pa_approved", { reviewer, edited });\n    rxCase.status = "ROUTED";\n    audit(rxCase, "prescription_routed", { route: "synthetic_internal_pharmacy" });\n    const events = [\n      integrationEvent("PaApproved", rxCase, { edited }),\n      integrationEvent("PrescriptionRouted", rxCase, { route: "synthetic_internal_pharmacy" })\n    ];\n    rxCase.version = expectedVersion + 1;\n    let saved: boolean;\n    try {\n      saved = await this.store.saveWithOutboxIfVersion(rxCase, expectedVersion, events, {\n        key: reviewBindingKey, requestFingerprint: reviewFingerprint\n      });\n    } catch (error) {\n      if (!(error instanceof IdempotencyKeyAlreadyBoundError)) throw error;\n      this.metrics.increment("review_idempotency_conflicts_total");\n      throw new AppError("review_idempotency_key_conflict", 409, false, "The review decision key was already used for a different decision.");\n    }\n    if (!saved) {\n      const winner = await this.store.getByIdempotencyKey(reviewBindingKey, tenantId);\n      if (winner) {\n        if (winner.case.id === caseId && winner.requestFingerprint === reviewFingerprint) {\n          this.metrics.increment("review_idempotent_replays_total");\n          return winner.case;\n        }\n        this.metrics.increment("review_idempotency_conflicts_total");\n        throw new AppError("review_idempotency_key_conflict", 409, false, "The review decision key was already used for a different decision.");\n      }\n      this.metrics.increment("review_conflicts_total");\n      throw new AppError("review_conflict", 409, false, "The case changed before this review could be committed. Reload the case before retrying.");\n    }\n    this.metrics.increment("human_approvals_total");\n    this.metrics.increment("routed_total");\n    return rxCase;\n  }\n\n  async get('''
+          s = s[:match.start()] + replacement + s[match.end():]
+          p.write_text(s)
+
+          # ---- HTTP API requires a stable decision key ----
+          p = Path('src/server.ts')
+          s = p.read_text()
+          old = '''      const expectedVersion = parseCaseIfMatch(\n        typeof req.headers["if-match"] === "string" ? req.headers["if-match"] : undefined,\n        approveMatch[1]\n      );\n      const finalAnswer = body.finalAnswer === undefined ? undefined : body.finalAnswer;\n      if (finalAnswer !== undefined && typeof finalAnswer !== "string") throw new AppError("invalid_review_answer", 400, false, "Reviewer answer must be a string.");\n      const approved = await workflow.approve(approveMatch[1], reviewer, expectedVersion, finalAnswer, principalTenant(principal));\n'''
+          new = '''      const expectedVersion = parseCaseIfMatch(\n        typeof req.headers["if-match"] === "string" ? req.headers["if-match"] : undefined,\n        approveMatch[1]\n      );\n      const reviewIdempotencyKey = parseIdempotencyKey(req.headers["x-idempotency-key"]);\n      if (!reviewIdempotencyKey) throw new AppError("review_idempotency_key_required", 400, false, "A review decision idempotency key is required.");\n      const finalAnswer = body.finalAnswer === undefined ? undefined : body.finalAnswer;\n      if (finalAnswer !== undefined && typeof finalAnswer !== "string") throw new AppError("invalid_review_answer", 400, false, "Reviewer answer must be a string.");\n      const approved = await workflow.approve(approveMatch[1], reviewer, expectedVersion, finalAnswer, principalTenant(principal), reviewIdempotencyKey);\n'''
+          s = require_replace(s, old, new, 'server approve route')
+          p.write_text(s)
+
+          # ---- bounded web proxy forwards only the additional decision header ----
+          p = Path('web/src/routes/api/[...path]/+server.ts')
+          s = p.read_text()
+          s = require_replace(s,
+          '["authorization", "if-match", "content-type", "x-correlation-id"] as const',
+          '["authorization", "if-match", "content-type", "x-correlation-id", "x-idempotency-key"] as const',
+          'proxy header allow-list')
+          p.write_text(s)
+
+          # ---- browser reuses one decision key until success/reload ----
+          p = Path('web/src/routes/+page.svelte')
+          s = p.read_text()
+          s = require_replace(s, '  let etag = "";\n  let token = "";\n', '  let etag = "";\n  let decisionKey = "";\n  let token = "";\n', 'page decision key state')
+          s = require_replace(s, '        etag = "";\n        finalAnswer = "";\n', '        etag = "";\n        decisionKey = "";\n        finalAnswer = "";\n', 'queue selection reset')
+          s = require_replace(s, '    etag = "";\n    finalAnswer = "";\n    message = `Loading case ${item.caseId}…`;\n', '    etag = "";\n    decisionKey = crypto.randomUUID();\n    finalAnswer = "";\n    message = `Loading case ${item.caseId}…`;\n', 'open case decision key')
+          s = require_replace(s, '    if (!selected || !reviewContext || !etag) {\n', '    if (!selected || !reviewContext || !etag || !decisionKey) {\n', 'approve guard')
+          s = require_replace(s, '          "content-type": "application/json",\n          "if-match": etag\n', '          "content-type": "application/json",\n          "if-match": etag,\n          "x-idempotency-key": decisionKey\n', 'approve idempotency header')
+          s = require_replace(s, '        reviewContext = null;\n        etag = "";\n        message = "This case changed after it was loaded. Reload the case before deciding again.";\n', '        reviewContext = null;\n        etag = "";\n        decisionKey = "";\n        message = "This case changed after it was loaded. Reload the case before deciding again.";\n', 'stale decision reset')
+          s = require_replace(s, '      etag = "";\n      finalAnswer = "";\n      await loadQueue();\n', '      etag = "";\n      decisionKey = "";\n      finalAnswer = "";\n      await loadQueue();\n', 'successful decision reset')
+          s = s.replace('Submitting version-guarded review decision…', 'Submitting version-guarded, safely retryable review decision…')
+          p.write_text(s)
+          PY
+
+      - name: Validate root idempotency contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          npm test
+
+      - name: Validate full-stack review contract
+        working-directory: web
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run check
+          npm run build
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+
+      - name: Commit validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/implement-review-idempotency.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src web test .github/workflows/implement-review-idempotency.yml
+          git commit -m 'Add durable review decision idempotency'
+          git push origin HEAD:agent/v0.8-review-idempotency
