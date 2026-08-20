@@ -1,0 +1,41 @@
+digraph RxFlow {
+  graph [rankdir=TB, bgcolor="transparent", pad="0.28", nodesep="0.38", ranksep="0.62", fontname="Arial", splines=ortho];
+  node [shape=box, style="rounded,filled", fillcolor="white", color="#9aa7b8", fontcolor="#142033", fontname="Arial", fontsize=11, margin="0.16,0.09"];
+  edge [color="#6b7890", fontcolor="#526176", fontname="Arial", fontsize=9, arrowsize=0.7];
+
+  ehr [label="Synthetic EHR / FHIR"];
+  smart [label="Synthetic SMART\nlaunch context"];
+  api [label="TypeScript API\nMedicationRequest / Bundle / Task", fillcolor="#edf3ff", color="#7797d8"];
+  {rank=same; ehr; smart; api;}
+  ehr -> api;
+  smart -> api [style=dashed];
+
+  idem [label="Tenant-scoped idempotency\n+ payload fingerprint"];
+  wf [label="Workflow service"];
+  benefits [label="Benefits decision"];
+  ai [label="Structured PA assistant\ntimeout + circuit breaker"];
+  validate [label="Schema + evidence\nvalidation"];
+  review [label="Authenticated pharmacist review\nETag / If-Match", fillcolor="#fff7dc", color="#d2a94a"];
+  route [label="Pharmacy routing", fillcolor="#e8f7ef", color="#60a47b"];
+  {rank=same; idem; wf; benefits; ai; validate; review; route;}
+  api -> idem -> wf -> benefits;
+  benefits -> route [label="no PA"];
+  benefits -> ai [label="PA required"];
+  ai -> validate -> review -> route;
+
+  db [shape=cylinder, label="PostgreSQL / SQLite\ncase state + transactional outbox", fillcolor="#f8f9fc"];
+  recovery [label="Two-person DLQ recovery\ncausal audit sequence", fillcolor="#fff4f4", color="#c97b7b"];
+  {rank=same; db; recovery;}
+  wf -> db;
+  review -> db;
+  route -> db;
+  recovery -> db [dir=both];
+
+  worker [label="Dedicated outbox worker\ntenant-fair ordered claims", fillcolor="#edf3ff", color="#7797d8"];
+  leases [label="Renewable leases\nretry / Retry-After / DLQ"];
+  sink [label="Pub/Sub or signed webhook"];
+  consumer [label="Authenticated consumer\neventId dedup + sequence check"];
+  effect [label="Atomic pharmacy projection", fillcolor="#e8f7ef", color="#60a47b"];
+  {rank=same; worker; leases; sink; consumer; effect;}
+  db -> worker -> leases -> sink -> consumer -> effect;
+}

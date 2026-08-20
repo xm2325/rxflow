@@ -1,0 +1,97 @@
+name: RxFlow CI
+
+on:
+  push:
+    branches:
+      - main
+      - agent/rxflow-repair
+      - agent/v0.9-review-governance
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rxflow
+          POSTGRES_PASSWORD: rxflow
+          POSTGRES_DB: rxflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rxflow -d rxflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RXFLOW_POSTGRES_TEST_URL: postgresql://rxflow:rxflow@127.0.0.1:5432/rxflow
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Release contract
+        run: npm run release:check
+      - name: Workflow governance coverage
+        run: npm run test:workflow:coverage
+      - name: Outbox reliability coverage
+        run: npm run test:outbox:coverage
+      - name: HTTP governance smoke
+        run: node integration/http-smoke.mjs
+      - name: PostgreSQL 17 live contract
+        run: npm run test:postgres:live
+
+  container-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image
+        run: docker build --pull -t rxflow-ci:${GITHUB_SHA} .
+      - name: Load compiled runtime
+        run: >-
+          docker run --rm rxflow-ci:${GITHUB_SHA}
+          node --input-type=module -e
+          "import('./dist/src/version.js').then(m => { if (m.VERSION !== '0.9.0') process.exit(2); console.log(m.VERSION); })"
+      - name: Assert non-root runtime
+        run: >-
+          docker run --rm rxflow-ci:${GITHUB_SHA}
+          node -e
+          "if (typeof process.getuid === 'function' && process.getuid() === 0) process.exit(1); console.log(process.getuid?.());"
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Reject high or critical dependency vulnerabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm audit --json > npm-audit.json || true
+          node <<'NODE'
+          const fs = require('fs');
+          const report = JSON.parse(fs.readFileSync('npm-audit.json', 'utf8'));
+          const v = report.metadata?.vulnerabilities ?? {};
+          const high = Number(v.high ?? 0);
+          const critical = Number(v.critical ?? 0);
+          console.log(JSON.stringify({ high, critical, vulnerabilities: v }));
+          if (high > 0 || critical > 0) process.exit(1);
+          NODE
+      - name: Generate CycloneDX SBOM
+        run: npm sbom --sbom-format=cyclonedx > rxflow-sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rxflow-sbom
+          path: rxflow-sbom.cdx.json
+          if-no-files-found: error
