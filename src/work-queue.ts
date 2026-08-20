@@ -1,6 +1,6 @@
 import type { RxCase } from "./domain.js";
 
-export type WorkQueueAction = "SECOND_REVIEW_APPROVAL" | "PHARMACIST_REVIEW" | "RETRYABLE_WORKFLOW_FAILURE" | "OPERATOR_REVIEW";
+export type WorkQueueAction = "SECOND_PHARMACIST_APPROVAL" | "PHARMACIST_REVIEW" | "RETRYABLE_WORKFLOW_FAILURE" | "OPERATOR_REVIEW";
 
 export interface WorkQueueItem {
   caseId: string;
@@ -16,11 +16,10 @@ export interface WorkQueueItem {
   updatedAt: string | null;
   reviewOwner: string | null;
   reviewLeaseUntil: string | null;
-  secondApprovalRequestedBy: string | null;
 }
 
 function actionFor(rxCase: RxCase): { action: WorkQueueAction; priority: number } | undefined {
-  if (rxCase.status === "HUMAN_REVIEW_REQUIRED" && rxCase.reviewEscalation) return { action: "SECOND_REVIEW_APPROVAL", priority: 120 };
+  if (rxCase.status === "SECOND_APPROVAL_REQUIRED") return { action: "SECOND_PHARMACIST_APPROVAL", priority: 110 };
   if (rxCase.status === "HUMAN_REVIEW_REQUIRED") return { action: "PHARMACIST_REVIEW", priority: 100 };
   if (rxCase.status === "FAILED_RETRYABLE") return { action: "RETRYABLE_WORKFLOW_FAILURE", priority: 80 };
   if (rxCase.status === "FAILED") return { action: "OPERATOR_REVIEW", priority: 70 };
@@ -29,7 +28,7 @@ function actionFor(rxCase: RxCase): { action: WorkQueueAction; priority: number 
 
 /**
  * Produces a data-minimised operational queue. Patient references, clinical
- * notes, PA answers, evidence values, and proposed override text are excluded.
+ * notes, PA answers, and evidence values are intentionally excluded.
  */
 export function buildWorkQueue(cases: RxCase[]): WorkQueueItem[] {
   return cases.flatMap((rxCase) => {
@@ -48,8 +47,7 @@ export function buildWorkQueue(cases: RxCase[]): WorkQueueItem[] {
       correlationId: rxCase.correlationId,
       updatedAt: rxCase.audit[rxCase.audit.length - 1]?.at ?? null,
       reviewOwner: rxCase.reviewClaim?.reviewer ?? null,
-      reviewLeaseUntil: rxCase.reviewClaim?.leaseUntil ?? null,
-      secondApprovalRequestedBy: rxCase.reviewEscalation?.requestedBy ?? null
+      reviewLeaseUntil: rxCase.reviewClaim?.leaseUntil ?? null
     }];
   }).sort((a, b) => {
     if (a.priority !== b.priority) return b.priority - a.priority;
