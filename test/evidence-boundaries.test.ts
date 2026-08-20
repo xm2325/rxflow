@@ -3,6 +3,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { findForbiddenPositiveClaims, type EvidenceRegistry } from "../src/evidence-boundaries.js";
 
+const repositoryRoot = new URL("../../", import.meta.url);
+
+async function readRegistry(): Promise<EvidenceRegistry> {
+  return JSON.parse(await readFile(new URL("docs/evidence-boundaries.json", repositoryRoot), "utf8")) as EvidenceRegistry;
+}
+
 test("forbidden positive deployment claims are detected", () => {
   const violations = findForbiddenPositiveClaims(
     "RxFlow is deployed to GCP with production PostgreSQL.",
@@ -19,7 +25,7 @@ test("forbidden positive EHR integration claims are detected", () => {
 });
 
 test("evidence registry separates local, implemented, and reference-only states", async () => {
-  const registry = JSON.parse(await readFile(new URL("../docs/evidence-boundaries.json", import.meta.url), "utf8")) as EvidenceRegistry;
+  const registry = await readRegistry();
   assert.equal(registry.evidenceStatus.syntheticFHIRWorkflow, "executed-local");
   assert.equal(registry.evidenceStatus.postgresAdapter, "implemented-not-live-here");
   assert.equal(registry.evidenceStatus.cloudRunCloudSqlPubSub, "reference-only");
@@ -28,7 +34,7 @@ test("evidence registry separates local, implemented, and reference-only states"
 });
 
 test("machine-readable public claims stay inside the evidence boundary", async () => {
-  const registry = JSON.parse(await readFile(new URL("../docs/evidence-boundaries.json", import.meta.url), "utf8")) as EvidenceRegistry;
+  const registry = await readRegistry();
   const violations = findForbiddenPositiveClaims((registry.publicClaims ?? []).join("\n"), registry.forbiddenPositiveClaims ?? []);
   assert.deepEqual(violations, []);
 });
