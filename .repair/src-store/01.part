@@ -1,0 +1,200 @@
+  getByIdempotencyKey(key: string, tenantId = "default"): IdempotencyLookup | undefined {
+    const record = this.idempotency.get(idempotencyStorageKey(tenantId, key));
+    if (!record) return undefined;
+    const rxCase = this.cases.get(record.caseId);
+    if (!rxCase || (tenantId !== undefined && caseTenant(rxCase) !== tenantId)) return undefined;
+    return { case: cloneCase(normalizeCaseVersion(rxCase)), requestFingerprint: record.requestFingerprint };
+  }
+
+  bindIdempotencyKey(key: string, caseId: string, requestFingerprint: string, tenantId = "default"): void {
+    const storageKey = idempotencyStorageKey(tenantId, key);
+    const existing = this.idempotency.get(storageKey);
+    if (existing && (existing.caseId !== caseId || existing.requestFingerprint !== requestFingerprint)) {
+      throw new IdempotencyKeyAlreadyBoundError();
+    }
+    const rxCase = this.cases.get(caseId);
+    if (tenantId !== undefined && (!rxCase || caseTenant(rxCase) !== tenantId)) throw new Error("case_not_found");
+    this.idempotency.set(storageKey, { caseId, requestFingerprint });
+  }
+
+  listOutbox(status?: OutboxStatus, tenantId?: string): OutboxRecord[] {
+    return [...this.outbox.values()]
+      .filter((record) => status === undefined || record.status === status)
+      .filter((record) => tenantId === undefined || eventTenant(record.event) === tenantId)
+      .map(cloneOutboxRecord);
+  }
+
+  claimOutbox(workerId: string, limit: number, leaseMs: number, now = new Date(), perTenantLimit = limit): ClaimedOutboxRecord[] {
+    if (limit < 1) return [];
+    if (leaseMs < 1) throw new Error("outbox_lease_must_be_positive");
+    if (!Number.isInteger(perTenantLimit) || perTenantLimit < 1) throw new Error("outbox_per_tenant_limit_must_be_positive");
+    const nowMs = now.getTime();
+    const leaseUntil = new Date(nowMs + leaseMs).toISOString();
+
+    // Recover expired leases first. Then rank eligible records within each tenant and
+    // interleave those ranks. A single noisy tenant can still use spare capacity, but
+    // it cannot occupy the front of every batch while another tenant has ready work.
+    for (const record of this.outbox.values()) {
+      if (record.status === "IN_FLIGHT" && record.leaseUntil && Date.parse(record.leaseUntil) <= nowMs) {
+        record.status = "PENDING";
+        clearClaim(record);
+      }
+    }
+
+    // Ordered aggregates use head-of-line delivery: a later sequence must not
+    // overtake an unresolved predecessor that is retrying, in flight, or dead-lettered.
+    // Unsequenced legacy events remain independent so old snapshots can still drain.
+    const aggregateHeads = new Map<string, number>();
+    for (const record of this.outbox.values()) {
+      if (record.status === "PUBLISHED" || record.status === "RETIRED") continue;
+      const key = aggregateKey(record.event);
+      const sequence = record.event.aggregateSequence;
+      if (!key || sequence === undefined) continue;
+      aggregateHeads.set(key, Math.min(aggregateHeads.get(key) ?? Number.POSITIVE_INFINITY, sequence));
+    }
+
+    const tenantRanks = new Map<string, number>();
+    const eligible: Array<{ record: OutboxRecord; tenantRank: number; insertionOrder: number }> = [];
+    let insertionOrder = 0;
+    for (const record of this.outbox.values()) {
+      const currentOrder = insertionOrder++;
+      if (record.status !== "PENDING") continue;
+      if (record.nextAttemptAt && Date.parse(record.nextAttemptAt) > nowMs) continue;
+      const key = aggregateKey(record.event);
+      const sequence = record.event.aggregateSequence;
+      if (key && sequence !== undefined && aggregateHeads.get(key) !== sequence) continue;
+      const tenantId = eventTenant(record.event);
+      const tenantRank = (tenantRanks.get(tenantId) ?? 0) + 1;
+      tenantRanks.set(tenantId, tenantRank);
+      eligible.push({ record, tenantRank, insertionOrder: currentOrder });
+    }
+    eligible.sort((a, b) => a.tenantRank - b.tenantRank || a.insertionOrder - b.insertionOrder);
+
+    const claimed: ClaimedOutboxRecord[] = [];
+    for (const { record } of eligible.filter((candidate) => candidate.tenantRank <= perTenantLimit).slice(0, limit)) {
+      record.status = "IN_FLIGHT";
+      record.claimId = randomUUID();
+      record.claimedBy = workerId;
+      record.leaseUntil = leaseUntil;
+      claimed.push(cloneOutboxRecord(record) as ClaimedOutboxRecord);
+    }
+    return claimed;
+  }
+
+  renewOutboxLease(eventId: string, claimId: string, leaseMs: number, now = new Date()): void {
+    if (leaseMs < 1) throw new Error("outbox_lease_must_be_positive");
+    const record = this.outbox.get(eventId);
+    if (!record) throw new Error("outbox_event_not_found");
+    if (record.status !== "IN_FLIGHT" || record.claimId !== claimId) throw new Error("stale_outbox_claim");
+    record.leaseUntil = new Date(now.getTime() + leaseMs).toISOString();
+  }
+
+  deferOutboxClaim(eventId: string, claimId: string, retryDelayMs = 0, now = new Date()): void {
+    if (retryDelayMs < 0) throw new Error("invalid_outbox_retry_delay");
+    const record = this.outbox.get(eventId);
+    if (!record) throw new Error("outbox_event_not_found");
+    if (record.status !== "IN_FLIGHT" || record.claimId !== claimId) throw new Error("stale_outbox_claim");
+    record.status = "PENDING";
+    record.nextAttemptAt = retryDelayMs > 0 ? new Date(now.getTime() + retryDelayMs).toISOString() : undefined;
+    clearClaim(record);
+  }
+
+  markOutboxPublished(eventId: string, claimId: string): void {
+    const record = this.outbox.get(eventId);
+    if (!record) throw new Error("outbox_event_not_found");
+    if (record.status !== "IN_FLIGHT" || record.claimId !== claimId) throw new Error("stale_outbox_claim");
+    record.attempts += 1;
+    record.status = "PUBLISHED";
+    record.publishedAt = new Date().toISOString();
+    record.lastError = undefined;
+    record.nextAttemptAt = undefined;
+    clearClaim(record);
+  }
+
+  markOutboxFailure(eventId: string, claimId: string, error: string, maxAttempts: number, retryDelayMs = 0, now = new Date()): OutboxStatus {
+    const record = this.outbox.get(eventId);
+    if (!record) throw new Error("outbox_event_not_found");
+    if (record.status !== "IN_FLIGHT" || record.claimId !== claimId) throw new Error("stale_outbox_claim");
+    if (retryDelayMs < 0) throw new Error("invalid_outbox_retry_delay");
+    record.attempts += 1;
+    record.lastError = error;
+    record.status = record.attempts >= maxAttempts ? "DEAD_LETTER" : "PENDING";
+    if (record.status === "DEAD_LETTER") record.recoveryGeneration = (record.recoveryGeneration ?? 0) + 1;
+    record.nextAttemptAt = record.status === "PENDING" && retryDelayMs > 0
+      ? new Date(now.getTime() + retryDelayMs).toISOString()
+      : undefined;
+    clearClaim(record);
+    return record.status;
+  }
+
+  redriveDeadLetter(eventId: string, tenantId?: string, expectedRecoveryGeneration?: number, actorId?: string): OutboxRecord {
+    const record = this.outbox.get(eventId);
+    if (!record || (tenantId !== undefined && eventTenant(record.event) !== tenantId)) throw new Error("outbox_event_not_found");
+    if (record.status !== "DEAD_LETTER") throw new Error("outbox_event_not_dead_letter");
+    if (expectedRecoveryGeneration !== undefined && (record.recoveryGeneration ?? 0) !== expectedRecoveryGeneration) throw new Error("stale_outbox_recovery");
+    const generation = record.recoveryGeneration ?? 0;
+    const tenant = eventTenant(record.event);
+    const redriveActor = actorId?.trim() || "system:redrive";
+    const now = new Date();
+    supersedePendingRetirementRequests(this.retirementRequests.values(), tenant, eventId, generation, redriveActor, now, this.recoveryAudit);
+    record.status = "PENDING";
+    record.attempts = 0;
+    record.publishedAt = undefined;
+    record.nextAttemptAt = undefined;
+    clearClaim(record);
+    if (actorId?.trim()) appendRecoveryAuditEntry(this.recoveryAudit, {
+      auditId: randomUUID(), tenantId: tenant, eventId, recoveryGeneration: generation, action: "REDRIVEN",
+      actorId: actorId.trim(), createdAt: now.toISOString()
+    });
+    return cloneOutboxRecord(record);
+  }
+
+  retireDeadLetter(request: OutboxRetirementRequest): OutboxRetirementResult {
+    validateRetirementIdentity(request.actorId, request.reference);
+    const record = this.outbox.get(request.eventId);
+    if (!record || (request.tenantId !== undefined && eventTenant(record.event) !== request.tenantId)) throw new Error("outbox_event_not_found");
+    if (record.status !== "DEAD_LETTER") throw new Error("outbox_event_not_dead_letter");
+    if ((record.recoveryGeneration ?? 0) !== request.expectedRecoveryGeneration) throw new Error("stale_outbox_recovery");
+    const now = request.now ?? new Date();
+    const replacementEvent = buildGapEvent(record, request.reasonCode, now);
+    if (this.outbox.has(replacementEvent.eventId)) throw new Error("outbox_event_already_exists");
+    record.status = "RETIRED";
+    record.retiredAt = now.toISOString();
+    record.retiredBy = request.actorId.trim();
+    record.retirementReasonCode = request.reasonCode;
+    record.retirementReference = request.reference.trim();
+    record.replacementEventId = replacementEvent.eventId;
+    record.nextAttemptAt = undefined;
+    clearClaim(record);
+    const replacement: OutboxRecord = { event: replacementEvent, status: "PENDING", attempts: 0, enqueuedAt: now.toISOString() };
+    this.outbox.set(replacementEvent.eventId, replacement);
+    return { retired: cloneOutboxRecord(record), replacement: cloneOutboxRecord(replacement) };
+  }
+
+  createRetirementApprovalRequest(request: Omit<OutboxRetirementApprovalRequest, "requestId" | "status" | "requestedAt"> & { now?: Date }): OutboxRetirementApprovalRequest {
+    validateRetirementIdentity(request.requestedBy, request.reference);
+    const record = this.outbox.get(request.eventId);
+    if (!record || eventTenant(record.event) !== request.tenantId) throw new Error("outbox_event_not_found");
+    if (record.status !== "DEAD_LETTER") throw new Error("outbox_event_not_dead_letter");
+    if ((record.recoveryGeneration ?? 0) !== request.recoveryGeneration) throw new Error("stale_outbox_recovery");
+    if (record.event.type === "DeliveryGapDeclared") throw new Error("gap_event_cannot_be_retired");
+    if (!aggregateKey(record.event)) throw new Error("outbox_event_not_ordered");
+    for (const existing of this.retirementRequests.values()) {
+      if (existing.tenantId === request.tenantId && existing.eventId === request.eventId && existing.recoveryGeneration === request.recoveryGeneration) throw new Error("retirement_request_exists");
+    }
+    const now = request.now ?? new Date();
+    const created: OutboxRetirementApprovalRequest = {
+      requestId: randomUUID(), tenantId: request.tenantId, eventId: request.eventId, recoveryGeneration: request.recoveryGeneration,
+      requestedBy: request.requestedBy.trim(), reasonCode: request.reasonCode, reference: request.reference.trim(), status: "PENDING", requestedAt: now.toISOString()
+    };
+    this.retirementRequests.set(created.requestId, created);
+    appendRecoveryAuditEntry(this.recoveryAudit, { auditId: randomUUID(), tenantId: created.tenantId, eventId: created.eventId, recoveryGeneration: created.recoveryGeneration,
+      action: "RETIREMENT_REQUESTED", actorId: created.requestedBy, createdAt: created.requestedAt, requestId: created.requestId, reasonCode: created.reasonCode, reference: created.reference });
+    return cloneRetirementRequest(created);
+  }
+
+  approveRetirementApprovalRequest(requestId: string, approverId: string, tenantId?: string, now = new Date()): OutboxRetirementApprovalResult {
+    const request = this.retirementRequests.get(requestId);
+    if (!request || (tenantId !== undefined && request.tenantId !== tenantId)) throw new Error("retirement_request_not_found");
+    if (request.status !== "PENDING") throw new Error("retirement_request_not_pending");
+    if (!approverId.trim()) throw new Error("retirement_approver_required");
