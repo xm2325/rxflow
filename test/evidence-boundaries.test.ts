@@ -35,6 +35,7 @@ test("evidence registry distinguishes observed CI, local, and reference-only sta
   assert.equal(registry.evidenceStatus.supplyChainAudit, "executed-in-ci");
   assert.equal(registry.evidenceStatus.terraformValidation, "executed-in-ci");
   assert.equal(registry.evidenceStatus.workflowGovernanceCoverage, "executed-in-ci");
+  assert.equal(registry.evidenceStatus.outboxReliabilityCoverage, "executed-in-ci");
   assert.equal(registry.evidenceStatus.cloudRunCloudSqlPubSub, "reference-only");
   assert.equal(registry.evidenceStatus.epic, "not-integrated");
   assert.equal(registry.evidenceStatus.realPatientData, "none");
