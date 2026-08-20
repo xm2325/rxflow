@@ -29,12 +29,31 @@ export interface AuditEvent {
   details: Record<string, string | number | boolean>;
 }
 
+export interface ReviewClaim {
+  reviewer: string;
+  claimedAt: string;
+  leaseUntil: string;
+}
+
+export interface ReviewEscalation {
+  escalationId: string;
+  requestedBy: string;
+  requestedAt: string;
+  proposedAnswer: string;
+  reason: "LOW_CONFIDENCE_EDIT";
+  baseVersion: number;
+}
 
 export interface HumanReviewDecision {
+  decisionId: string;
   reviewer: string;
+  secondReviewer?: string;
   edited: boolean;
   finalAnswer: string;
+  answerHash: string;
   reviewedAt: string;
+  committedFromVersion: number;
+  committedToVersion: number;
 }
 
 export interface WorkflowFailure {
@@ -61,6 +80,8 @@ export interface RxCase {
   status: WorkflowStatus;
   priorAuthRequired: boolean | null;
   paDraft?: PriorAuthDraft;
+  reviewClaim?: ReviewClaim;
+  reviewEscalation?: ReviewEscalation;
   reviewDecision?: HumanReviewDecision;
   failure?: WorkflowFailure;
   audit: AuditEvent[];
