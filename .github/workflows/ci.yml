@@ -39,6 +39,8 @@ jobs:
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Release contract
         run: npm run release:check
+      - name: Workflow governance coverage
+        run: npm run test:workflow:coverage
       - name: HTTP governance smoke
         run: node integration/http-smoke.mjs
       - name: PostgreSQL 17 live contract
