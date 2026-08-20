@@ -32,7 +32,7 @@
     "Tenant-scoped idempotency and durable outbox contracts exercised in GitHub Actions",
     "GCP infrastructure is a reference deployment target only",
     "Epic and Surescripts are not integrated",
-    "No real patient data or clinical deployment"
+    "Synthetic fixtures only; no real-world patient records are used and the project is not clinically deployed"
   ],
   "statuses": {
     "postgresAdapter": "implemented-not-live-here",
