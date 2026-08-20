@@ -17,6 +17,7 @@ export function validateEvidenceStatuses(registry: EvidenceRegistry): void {
     sqliteProcessConcurrency: "executed-local",
     postgresAdapter: "executed-in-ci",
     postgres17CiScenario: "executed-in-ci",
+    postgresReviewGovernance: "executed-in-ci",
     containerRuntime: "executed-in-ci",
     supplyChainAudit: "executed-in-ci",
     terraformValidation: "executed-in-ci",
