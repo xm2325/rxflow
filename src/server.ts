@@ -277,12 +277,31 @@ const server = createServer(async (req, res) => {
       return send(res, status, toOperationsIngestResult(result), correlationId, { etag: caseEtag(result.case.id, result.case.version) });
     }
 
+    const reviewClaimMatch = req.url?.match(/^\/v1\/cases\/([^/]+)\/review-claim$/);
+    if (req.method === "POST" && reviewClaimMatch) {
+      const principal = reviewPrincipal(req);
+      const body = (await readJson(req)) as { reviewer?: unknown; leaseSeconds?: unknown };
+      const reviewer = reviewerIdentity(body.reviewer, principal, config.nodeEnv !== "production" && !config.trustPlatformIam);
+      const expectedVersion = parseCaseIfMatch(
+        typeof req.headers["if-match"] === "string" ? req.headers["if-match"] : undefined,
+        reviewClaimMatch[1]
+      );
+      const leaseSeconds = body.leaseSeconds === undefined ? 300 : body.leaseSeconds;
+      if (!Number.isInteger(leaseSeconds) || (leaseSeconds as number) < 30 || (leaseSeconds as number) > 1800) {
+        throw new AppError("invalid_review_lease", 400, false, "Review leaseSeconds must be an integer between 30 and 1800.");
+      }
+      const claimed = await workflow.claimReview(
+        reviewClaimMatch[1], reviewer, expectedVersion, principalTenant(principal), (leaseSeconds as number) * 1000
+      );
+      return send(res, 200, toReviewerContextView(claimed), correlationId, { etag: caseEtag(claimed.id, claimed.version) });
+    }
+
     const reviewContextMatch = req.url?.match(/^\/v1\/cases\/([^/]+)\/review-context$/);
     if (req.method === "GET" && reviewContextMatch) {
       const principal = reviewPrincipal(req);
       const rxCase = await workflow.get(reviewContextMatch[1], principalTenant(principal));
       if (!rxCase) throw new AppError("case_not_found", 404, false, "Case not found.");
-      if (rxCase.status !== "HUMAN_REVIEW_REQUIRED") throw new AppError("case_not_reviewable", 409, false, "The case is not waiting for human review.");
+      if (rxCase.status !== "HUMAN_REVIEW_REQUIRED" && rxCase.status !== "SECOND_APPROVAL_REQUIRED") throw new AppError("case_not_reviewable", 409, false, "The case is not waiting for human review.");
       return send(res, 200, toReviewerContextView(rxCase), correlationId, { etag: caseEtag(rxCase.id, rxCase.version) });
     }
 
@@ -296,7 +315,7 @@ const server = createServer(async (req, res) => {
 
     const approveMatch = req.url?.match(/^\/v1\/cases\/([^/]+)\/approve$/);
     if (req.method === "POST" && approveMatch) {
-      const principal = approvalPrincipal(req);
+      const principal = reviewPrincipal(req);
       const body = (await readJson(req)) as { reviewer?: unknown; finalAnswer?: unknown };
       const reviewer = reviewerIdentity(body.reviewer, principal, config.nodeEnv !== "production" && !config.trustPlatformIam);
       const expectedVersion = parseCaseIfMatch(
@@ -305,7 +324,29 @@ const server = createServer(async (req, res) => {
       );
       const finalAnswer = body.finalAnswer === undefined ? undefined : body.finalAnswer;
       if (finalAnswer !== undefined && typeof finalAnswer !== "string") throw new AppError("invalid_review_answer", 400, false, "Reviewer answer must be a string.");
-      const approved = await workflow.approve(approveMatch[1], reviewer, expectedVersion, finalAnswer, principalTenant(principal));
+      const decisionKey = parseIdempotencyKey(req.headers["x-idempotency-key"]);
+      if (!decisionKey) throw new AppError("review_idempotency_key_required", 400, false, "An X-Idempotency-Key is required for review decisions.");
+      const approved = await workflow.approve(
+        approveMatch[1], reviewer, expectedVersion, finalAnswer, principalTenant(principal), decisionKey, true
+      );
+      triggerOutboxPublish();
+      return send(res, 200, toOperationsCaseDetail(approved), correlationId, { etag: caseEtag(approved.id, approved.version) });
+    }
+
+    const secondApproveMatch = req.url?.match(/^\/v1\/cases\/([^/]+)\/second-approve$/);
+    if (req.method === "POST" && secondApproveMatch) {
+      const principal = reviewPrincipal(req);
+      const body = (await readJson(req)) as { reviewer?: unknown };
+      const reviewer = reviewerIdentity(body.reviewer, principal, config.nodeEnv !== "production" && !config.trustPlatformIam);
+      const expectedVersion = parseCaseIfMatch(
+        typeof req.headers["if-match"] === "string" ? req.headers["if-match"] : undefined,
+        secondApproveMatch[1]
+      );
+      const decisionKey = parseIdempotencyKey(req.headers["x-idempotency-key"]);
+      if (!decisionKey) throw new AppError("review_idempotency_key_required", 400, false, "An X-Idempotency-Key is required for review decisions.");
+      const approved = await workflow.secondApprove(
+        secondApproveMatch[1], reviewer, expectedVersion, principalTenant(principal), decisionKey, true
+      );
       triggerOutboxPublish();
       return send(res, 200, toOperationsCaseDetail(approved), correlationId, { etag: caseEtag(approved.id, approved.version) });
     }
