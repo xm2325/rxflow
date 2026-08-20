@@ -41,6 +41,8 @@ jobs:
         run: npm run release:check
       - name: Workflow governance coverage
         run: npm run test:workflow:coverage
+      - name: Outbox reliability coverage
+        run: npm run test:outbox:coverage
       - name: HTTP governance smoke
         run: node integration/http-smoke.mjs
       - name: PostgreSQL 17 live contract
