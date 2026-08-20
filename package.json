@@ -12,7 +12,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/*.test.js",
     "test:core": "npm run build && node --test dist/test/workflow-core.test.js dist/test/fhir-contract.test.js dist/test/outbox-contract.test.js dist/test/config-contract.test.js",
-    "test:workflow:coverage": "npm run build && node --experimental-test-coverage --test-coverage-include=dist/src/workflow.js --test-coverage-lines=70 --test-coverage-branches=55 --test-coverage-functions=75 --test dist/test/*.test.js",
+    "test:workflow:coverage": "npm run build && node --experimental-test-coverage --test-coverage-include=dist/src/workflow.js --test-coverage-lines=85 --test-coverage-branches=70 --test-coverage-functions=80 --test dist/test/*.test.js",
     "test:postgres:live": "npm run build && node integration/postgres17-live.mjs",
     "check:evidence": "npm run build && node dist/src/evidence-boundaries-check.js",
     "check:hygiene": "npm run build && node dist/src/repository-hygiene-check.js",

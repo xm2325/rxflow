@@ -4,15 +4,17 @@ RxFlow is an independent synthetic healthcare software-engineering project. This
 
 ## Observed in GitHub Actions
 
-For the v0.9.0 release-candidate branch, GitHub Actions has exercised the modular workflow/FHIR/outbox/configuration contracts, the review-governance state machine, the full HTTP governance smoke, PostgreSQL 17 live integration, container build and non-root runtime checks, dependency audit/SBOM generation, Terraform formatting/initialisation/validation, and a dedicated workflow-governance coverage gate.
+For the v0.9.0 release-candidate branch, GitHub Actions has exercised the modular workflow/FHIR/outbox/configuration contracts, the review-governance state machine, resilience and fail-closed workflow paths, the full HTTP governance smoke, PostgreSQL 17 live integration, container build and non-root runtime checks, dependency audit/SBOM generation, Terraform formatting/initialisation/validation, and a dedicated workflow-governance coverage gate.
 
-The workflow coverage gate requires at least 70% line coverage, 55% branch coverage, and 75% function coverage for `dist/src/workflow.js`. On the observed GitHub Actions run used to promote this evidence state, the measured coverage was 73.75% lines, 60.81% branches, and 80.77% functions.
+The current GitHub-native regression surface contains 59 tests. The workflow coverage gate requires at least 85% line coverage, 70% branch coverage, and 80% function coverage for `dist/src/workflow.js`. On the observed GitHub Actions run used to tighten this gate, the measured coverage was 88.80% lines, 75.90% branches, and 80.77% functions.
 
 The machine-readable status for these boundaries is maintained in `docs/evidence-boundaries.json`. A status of `executed-in-ci` means the corresponding contract has been observed on the GitHub Actions runner for this release-candidate line; it does not imply a production deployment.
 
 ## Review-governance boundary
 
 The v0.9.0 workflow adds lease-bound review ownership, optimistic version checks, durable tenant-scoped decision idempotency, and a fail-closed second-approval route for low-confidence edited PA drafts. The second approval must be performed by a reviewer distinct from the first reviewer before the case can route.
+
+The resilience regression surface also exercises PA dependency retry and terminal failure, containment of model output that attempts to skip review, stale human-review rejection, duplicate approval prevention, bounded reviewer corrections, operations-view data minimisation, and cross-instance idempotency races.
 
 ## Implemented boundaries
 
