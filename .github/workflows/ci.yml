@@ -1,4 +1,5 @@
-name: ci
+name: RxFlow CI
+
 on:
   push:
   pull_request:
@@ -6,55 +7,38 @@ on:
 jobs:
   release-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci --ignore-scripts --no-audit --no-fund
+          cache: npm
+      - run: npm ci
       - run: npm run release:check
-      - name: Upload local release evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rxflow-release-evidence
-          path: |
-            docs/release-evidence-*.json
-            artifacts/release-evidence-*.json
-          if-no-files-found: warn
 
   postgres-live:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     services:
       postgres:
         image: postgres:17
         env:
           POSTGRES_USER: rxflow
-          POSTGRES_PASSWORD: rxflow_test_password
+          POSTGRES_PASSWORD: rxflow
           POSTGRES_DB: rxflow
         ports:
           - 5432:5432
         options: >-
           --health-cmd "pg_isready -U rxflow -d rxflow"
-          --health-interval 5s
+          --health-interval 10s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 5
+    env:
+      RXFLOW_POSTGRES_TEST_URL: postgresql://rxflow:rxflow@127.0.0.1:5432/rxflow
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Run live PostgreSQL concurrency gate
-        env:
-          RXFLOW_POSTGRES_TEST_URL: postgres://rxflow:rxflow_test_password@127.0.0.1:5432/rxflow
-        run: npm run test:postgres:live
-      - name: Upload PostgreSQL live evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rxflow-postgres-live-evidence
-          path: artifacts/postgres-live-evidence.json
-          if-no-files-found: warn
+          cache: npm
+      - run: npm ci
+      - run: npm run test:postgres:live
