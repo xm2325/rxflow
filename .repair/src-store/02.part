@@ -1,0 +1,252 @@
+    if (approverId.trim() === request.requestedBy) throw new Error("retirement_separation_of_duties");
+    const result = this.retireDeadLetter({ eventId: request.eventId, actorId: approverId.trim(), reasonCode: request.reasonCode, reference: request.reference, tenantId: request.tenantId, expectedRecoveryGeneration: request.recoveryGeneration, now });
+    request.status = "APPROVED"; request.approvedBy = approverId.trim(); request.approvedAt = now.toISOString(); request.replacementEventId = result.replacement.event.eventId;
+    appendRecoveryAuditEntry(this.recoveryAudit, { auditId: randomUUID(), tenantId: request.tenantId, eventId: request.eventId, recoveryGeneration: request.recoveryGeneration,
+      action: "RETIREMENT_APPROVED", actorId: approverId.trim(), createdAt: request.approvedAt, requestId, reasonCode: request.reasonCode, reference: request.reference, replacementEventId: request.replacementEventId });
+    return { request: cloneRetirementRequest(request), retired: result.retired, replacement: result.replacement };
+  }
+
+  listRetirementApprovalRequests(tenantId?: string, eventId?: string): OutboxRetirementApprovalRequest[] {
+    return [...this.retirementRequests.values()].filter((r) => tenantId === undefined || r.tenantId === tenantId).filter((r) => eventId === undefined || r.eventId === eventId).sort((a,b) => a.requestedAt.localeCompare(b.requestedAt)).map(cloneRetirementRequest);
+  }
+
+  listOutboxRecoveryAudit(eventId: string, tenantId?: string): OutboxRecoveryAuditEntry[] {
+    return this.recoveryAudit.filter((e) => e.eventId === eventId).filter((e) => tenantId === undefined || e.tenantId === tenantId).sort((a,b) => a.sequence - b.sequence).map(cloneRecoveryAudit);
+  }
+
+  size(): number {
+    return this.cases.size;
+  }
+
+  healthCheck(): void {}
+
+  getOutboxCounts(): OutboxCounts {
+    const counts: OutboxCounts = { pending: 0, inFlight: 0, published: 0, deadLetter: 0, retired: 0 };
+    for (const record of this.outbox.values()) {
+      if (record.status === "PENDING") counts.pending += 1;
+      else if (record.status === "IN_FLIGHT") counts.inFlight += 1;
+      else if (record.status === "PUBLISHED") counts.published += 1;
+      else if (record.status === "DEAD_LETTER") counts.deadLetter += 1;
+      else if (record.status === "RETIRED") counts.retired += 1;
+    }
+    return counts;
+  }
+
+  getOutboxPressure(ageTargetMs?: number, now = new Date()): OutboxPressure {
+    if (ageTargetMs !== undefined && (!Number.isFinite(ageTargetMs) || ageTargetMs < 0)) throw new Error("invalid_outbox_age_target");
+    const byTenant = new Map<string, number>();
+    const overdueTenants = new Set<string>();
+    let pending = 0;
+    let overduePending = 0;
+    let oldestPendingAgeMs = 0;
+    let orderedBlockedPending = 0;
+    const orderedBlockedAggregates = new Set<string>();
+    const unresolvedHeads = new Map<string, number>();
+    for (const record of this.outbox.values()) {
+      if (record.status === "PUBLISHED" || record.status === "RETIRED") continue;
+      const key = aggregateKey(record.event);
+      const sequence = record.event.aggregateSequence;
+      if (key && sequence !== undefined) unresolvedHeads.set(key, Math.min(unresolvedHeads.get(key) ?? Number.POSITIVE_INFINITY, sequence));
+    }
+    for (const record of this.outbox.values()) {
+      if (record.status !== "PENDING") continue;
+      pending += 1;
+      const tenantId = eventTenant(record.event);
+      byTenant.set(tenantId, (byTenant.get(tenantId) ?? 0) + 1);
+      const enqueuedAt = record.enqueuedAt ?? record.event.occurredAt;
+      const ageMs = Math.max(0, now.getTime() - Date.parse(enqueuedAt));
+      oldestPendingAgeMs = Math.max(oldestPendingAgeMs, ageMs);
+      if (ageTargetMs !== undefined && ageMs > ageTargetMs) {
+        overduePending += 1;
+        overdueTenants.add(tenantId);
+      }
+      const key = aggregateKey(record.event);
+      const sequence = record.event.aggregateSequence;
+      if (key && sequence !== undefined && unresolvedHeads.get(key) !== sequence) {
+        orderedBlockedPending += 1;
+        orderedBlockedAggregates.add(key);
+      }
+    }
+    return {
+      pending,
+      activePendingTenants: byTenant.size,
+      largestTenantPending: Math.max(0, ...byTenant.values()),
+      oldestPendingAgeMs,
+      overduePending,
+      overduePendingTenants: overdueTenants.size,
+      orderedBlockedPending,
+      orderedBlockedAggregates: orderedBlockedAggregates.size
+    };
+  }
+
+  protected enqueue(events: IntegrationEvent[]): void {
+    for (const event of events) {
+      if (this.outbox.has(event.eventId)) throw new Error("outbox_event_already_exists");
+      this.outbox.set(event.eventId, { event, status: "PENDING", attempts: 0, enqueuedAt: event.occurredAt });
+    }
+  }
+
+  protected snapshot(): StoreSnapshot {
+    return {
+      cases: [...this.cases.values()].map(cloneCase),
+      idempotency: [...this.idempotency.entries()],
+      outbox: [...this.outbox.values()].map(cloneOutboxRecord),
+      retirementRequests: [...this.retirementRequests.values()].map(cloneRetirementRequest),
+      recoveryAudit: this.recoveryAudit.map(cloneRecoveryAudit)
+    };
+  }
+
+  protected restore(snapshot: StoreSnapshot): void {
+    this.cases.clear();
+    this.idempotency.clear();
+    this.outbox.clear();
+    this.retirementRequests.clear();
+    this.recoveryAudit.length = 0;
+    for (const rxCase of snapshot.cases) this.cases.set(rxCase.id, cloneCase(normalizeCaseVersion(rxCase)));
+    for (const [storedKey, record] of snapshot.idempotency) {
+      const rxCase = this.cases.get(record.caseId);
+      const tenantId = rxCase ? caseTenant(rxCase) : "default";
+      const externalKey = legacyExternalKey(tenantId, storedKey);
+      this.idempotency.set(idempotencyStorageKey(tenantId, externalKey), record);
+    }
+    for (const record of snapshot.outbox ?? []) this.outbox.set(record.event.eventId, record);
+    for (const request of snapshot.retirementRequests ?? []) this.retirementRequests.set(request.requestId, request);
+    for (const legacyEntry of snapshot.recoveryAudit ?? []) {
+      const entry = legacyEntry as OutboxRecoveryAuditEntry & { sequence?: number };
+      if (Number.isInteger(entry.sequence) && (entry.sequence ?? 0) > 0) this.recoveryAudit.push(entry);
+      else appendRecoveryAuditEntry(this.recoveryAudit, { ...entry, sequence: undefined } as unknown as Omit<OutboxRecoveryAuditEntry, "sequence">);
+    }
+  }
+}
+
+export class JsonFileCaseStore extends InMemoryCaseStore {
+  constructor(private readonly filePath: string) {
+    super();
+    this.load();
+  }
+
+  override save(rxCase: RxCase): void {
+    super.save(rxCase);
+    this.flush();
+  }
+
+  override createCase(rxCase: RxCase, idempotencyKey: string, requestFingerprint: string, events: IntegrationEvent[] = []): void {
+    super.createCase(rxCase, idempotencyKey, requestFingerprint, events);
+    this.flush();
+  }
+
+  override saveWithOutbox(rxCase: RxCase, events: IntegrationEvent[]): void {
+    super.saveWithOutbox(rxCase, events);
+    this.flush();
+  }
+
+  override saveWithOutboxIfStatus(rxCase: RxCase, expectedStatus: WorkflowStatus, events: IntegrationEvent[]): boolean {
+    const saved = super.saveWithOutboxIfStatus(rxCase, expectedStatus, events);
+    if (saved) this.flush();
+    return saved;
+  }
+
+  override saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[]): boolean {
+    const saved = super.saveWithOutboxIfVersion(rxCase, expectedVersion, events);
+    if (saved) this.flush();
+    return saved;
+  }
+
+  override bindIdempotencyKey(key: string, caseId: string, requestFingerprint: string, tenantId?: string): void {
+    super.bindIdempotencyKey(key, caseId, requestFingerprint, tenantId);
+    this.flush();
+  }
+
+  override claimOutbox(workerId: string, limit: number, leaseMs: number, now = new Date(), perTenantLimit = limit): ClaimedOutboxRecord[] {
+    const records = super.claimOutbox(workerId, limit, leaseMs, now, perTenantLimit);
+    if (records.length > 0) this.flush();
+    return records;
+  }
+
+  override renewOutboxLease(eventId: string, claimId: string, leaseMs: number, now = new Date()): void {
+    super.renewOutboxLease(eventId, claimId, leaseMs, now);
+    this.flush();
+  }
+
+  override deferOutboxClaim(eventId: string, claimId: string, retryDelayMs = 0, now = new Date()): void {
+    super.deferOutboxClaim(eventId, claimId, retryDelayMs, now);
+    this.flush();
+  }
+
+  override markOutboxPublished(eventId: string, claimId: string): void {
+    super.markOutboxPublished(eventId, claimId);
+    this.flush();
+  }
+
+  override markOutboxFailure(eventId: string, claimId: string, error: string, maxAttempts: number, retryDelayMs = 0, now = new Date()): OutboxStatus {
+    const status = super.markOutboxFailure(eventId, claimId, error, maxAttempts, retryDelayMs, now);
+    this.flush();
+    return status;
+  }
+
+  override redriveDeadLetter(eventId: string, tenantId?: string, expectedRecoveryGeneration?: number, actorId?: string): OutboxRecord {
+    const record = super.redriveDeadLetter(eventId, tenantId, expectedRecoveryGeneration, actorId);
+    this.flush();
+    return record;
+  }
+
+  override retireDeadLetter(request: OutboxRetirementRequest): OutboxRetirementResult {
+    const result = super.retireDeadLetter(request);
+    this.flush();
+    return result;
+  }
+
+  override createRetirementApprovalRequest(request: Omit<OutboxRetirementApprovalRequest, "requestId" | "status" | "requestedAt"> & { now?: Date }): OutboxRetirementApprovalRequest {
+    const result = super.createRetirementApprovalRequest(request); this.flush(); return result;
+  }
+  override approveRetirementApprovalRequest(requestId: string, approverId: string, tenantId?: string, now = new Date()): OutboxRetirementApprovalResult {
+    const result = super.approveRetirementApprovalRequest(requestId, approverId, tenantId, now); this.flush(); return result;
+  }
+
+  private load(): void {
+    if (!existsSync(this.filePath)) return;
+    const parsed = JSON.parse(readFileSync(this.filePath, "utf8")) as Partial<StoreSnapshot>;
+    if (!Array.isArray(parsed.cases) || !Array.isArray(parsed.idempotency)) {
+      throw new Error("invalid_store_snapshot");
+    }
+    this.restore({ cases: parsed.cases, idempotency: parsed.idempotency, outbox: Array.isArray(parsed.outbox) ? parsed.outbox : [],
+      retirementRequests: Array.isArray(parsed.retirementRequests) ? parsed.retirementRequests : [], recoveryAudit: Array.isArray(parsed.recoveryAudit) ? parsed.recoveryAudit : [] });
+  }
+
+  private flush(): void {
+    const folder = dirname(this.filePath);
+    mkdirSync(folder, { recursive: true });
+    const temporary = `${this.filePath}.tmp`;
+    writeFileSync(temporary, JSON.stringify(this.snapshot(), null, 2), "utf8");
+    renameSync(temporary, this.filePath);
+  }
+}
+
+interface SqliteCaseRow { case_json: string; }
+interface SqliteIdempotencyRow { case_json: string; request_fingerprint: string; }
+interface SqliteOutboxRow {
+  event_json: string;
+  status: OutboxStatus;
+  attempts: number;
+  last_error: string | null;
+  published_at: string | null;
+  claim_id: string | null;
+  claimed_by: string | null;
+  lease_until: string | null;
+  next_attempt_at: string | null;
+  created_at: string | null;
+  retired_at: string | null;
+  retired_by: string | null;
+  retirement_reason_code: string | null;
+  retirement_reference: string | null;
+  replacement_event_id: string | null;
+  recovery_generation: number;
+}
+interface SqliteCountRow { count: number; }
+interface SqliteStatusCountRow { status: OutboxStatus; count: number; }
+interface SqliteSchemaRow { sql: string | null; }
+interface SqliteColumnRow { name: string; }
+interface SqliteCaseTenantRow { id: string; case_json: string; }
+interface SqliteOutboxTenantRow { event_id: string; event_json: string; }
+interface SqliteIdempotencyMigrationRow { key: string; tenant_id: string; case_id: string; request_fingerprint: string; }
+
