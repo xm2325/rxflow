@@ -54,7 +54,7 @@ jobs:
         run: >-
           docker run --rm rxflow-ci:${GITHUB_SHA}
           node --input-type=module -e
-          "import('./dist/src/version.js').then(m => { if (m.VERSION !== '0.6.0') process.exit(2); console.log(m.VERSION); })"
+          "import('./dist/src/version.js').then(m => { if (m.VERSION !== '0.9.0') process.exit(2); console.log(m.VERSION); })"
       - name: Assert non-root runtime
         run: >-
           docker run --rm rxflow-ci:${GITHUB_SHA}

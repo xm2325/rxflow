@@ -13,10 +13,13 @@ export function findForbiddenPositiveClaims(text: string, phrases: string[]): st
 
 export function validateEvidenceStatuses(registry: EvidenceRegistry): void {
   const expected: Record<string, string> = {
-    syntheticFHIRWorkflow: "executed-local",
+    syntheticFHIRWorkflow: "executed-in-ci",
     sqliteProcessConcurrency: "executed-local",
-    postgresAdapter: "implemented-not-live-here",
-    postgres17CiScenario: "implemented-awaiting-observed-ci-result",
+    postgresAdapter: "executed-in-ci",
+    postgres17CiScenario: "executed-in-ci",
+    containerRuntime: "executed-in-ci",
+    supplyChainAudit: "executed-in-ci",
+    terraformValidation: "executed-in-ci",
     cloudRunCloudSqlPubSub: "reference-only",
     epic: "not-integrated",
     surescripts: "not-integrated",

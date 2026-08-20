@@ -24,10 +24,16 @@ test("forbidden positive EHR integration claims are detected", () => {
   ), ["Epic integration"]);
 });
 
-test("evidence registry separates local, implemented, and reference-only states", async () => {
+test("evidence registry distinguishes observed CI, local, and reference-only states", async () => {
   const registry = await readRegistry();
-  assert.equal(registry.evidenceStatus.syntheticFHIRWorkflow, "executed-local");
-  assert.equal(registry.evidenceStatus.postgresAdapter, "implemented-not-live-here");
+  assert.equal(registry.releaseVersion, "0.9.0");
+  assert.equal(registry.evidenceStatus.syntheticFHIRWorkflow, "executed-in-ci");
+  assert.equal(registry.evidenceStatus.sqliteProcessConcurrency, "executed-local");
+  assert.equal(registry.evidenceStatus.postgresAdapter, "executed-in-ci");
+  assert.equal(registry.evidenceStatus.postgres17CiScenario, "executed-in-ci");
+  assert.equal(registry.evidenceStatus.containerRuntime, "executed-in-ci");
+  assert.equal(registry.evidenceStatus.supplyChainAudit, "executed-in-ci");
+  assert.equal(registry.evidenceStatus.terraformValidation, "executed-in-ci");
   assert.equal(registry.evidenceStatus.cloudRunCloudSqlPubSub, "reference-only");
   assert.equal(registry.evidenceStatus.epic, "not-integrated");
   assert.equal(registry.evidenceStatus.realPatientData, "none");
