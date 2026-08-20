@@ -1,23 +1,25 @@
-# RxFlow v0.5.0 project evidence
+# RxFlow project evidence
 
-RxFlow is an independent synthetic healthcare software-engineering project. This page separates executable local evidence from integration and deployment boundaries that are present only as code, configuration, or reference architecture.
+RxFlow is an independent synthetic healthcare software-engineering project. This document separates what has been observed in executable CI from what is implemented but not deployed.
 
-## Executed locally
+## Executed in GitHub Actions
 
-- Synthetic FHIR `MedicationRequest`/`Bundle`/`Task` workflow with PA assistance and human review.
-- SQLite transaction, lease, multi-worker, recovery, ordering, and idempotency tests.
-- Request/log data-boundary, dashboard security, operational-error, OpenAPI, dependency-lock, repository-hygiene, and public-surface checks.
-- The complete local release gate and generated machine-readable release evidence.
+The current v0.6.0 repair/upgrade branch records successful evidence files under `docs/ci-evidence/` only after the corresponding gate completes. The observed contracts include modular workflow/FHIR/outbox/configuration tests, PostgreSQL 17 live integration, container runtime checks, and dependency/SBOM checks when their evidence files are present.
 
-## Implemented but not live-executed here
+## Implemented boundaries
 
-- PostgreSQL adapter, migrations, claim SQL, and PostgreSQL 17 CI scenario.
-- GCP Pub/Sub REST publisher and authenticated push contract with injected/local tests.
+The codebase contains tenant-scoped idempotency, optimistic concurrency, transactional outbox persistence, lease-based dispatch, aggregate ordering, dead-letter recovery, two-person destructive recovery approval, bounded operational errors, FHIR ingestion helpers, and PostgreSQL/SQLite storage implementations.
 
-## Reference-only or not integrated
+## Reference-only infrastructure
 
-- Cloud Run + Cloud SQL + Pub/Sub Terraform is a reference target, not an observed deployment.
-- Epic and Surescripts are not integrated.
-- The repository contains no real patient data, clinical deployment, or compliance certification.
+`infra/gcp/` describes a reference Cloud Run / Cloud SQL / Pub/Sub target. Repository infrastructure code or Terraform validation is not evidence that a live GCP environment has been deployed.
 
-Run `npm run demo:evidence` for a compact executable review path and `npm run release:check` for the full local gate. Machine-readable status is in [`evidence-boundaries.json`](evidence-boundaries.json).
+## Explicit non-claims
+
+- Epic is not integrated.
+- Surescripts is not integrated.
+- No real patient data is used.
+- No clinical deployment is claimed.
+- No HIPAA, NHS DSPT, SOC 2, or other compliance certification is claimed.
+
+Synthetic fixtures and CI scenarios are used to exercise engineering contracts without representing a production healthcare deployment.

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "releaseVersion": "0.5.0",
+  "releaseVersion": "0.6.0",
   "evidenceStatus": {
     "syntheticFHIRWorkflow": "executed-local",
     "sqliteProcessConcurrency": "executed-local",
@@ -28,9 +28,22 @@
     "clinical deployment"
   ],
   "publicClaims": [
-    "Synthetic FHIR workflow executed locally",
-    "SQLite multi-process concurrency executed locally",
-    "PostgreSQL adapter implemented; live execution pending CI evidence",
-    "GCP infrastructure is a reference target only"
-  ]
+    "Synthetic FHIR workflow implemented and exercised in automated tests",
+    "Tenant-scoped idempotency and durable outbox contracts exercised in GitHub Actions",
+    "GCP infrastructure is a reference deployment target only",
+    "Epic and Surescripts are not integrated",
+    "No real patient data or clinical deployment"
+  ],
+  "statuses": {
+    "postgresAdapter": "implemented-not-live-here",
+    "postgres17CiScenario": "implemented-awaiting-observed-ci-result",
+    "containerRuntime": "implemented-awaiting-observed-ci-result",
+    "supplyChainAudit": "implemented-awaiting-observed-ci-result",
+    "cloudRunCloudSqlPubSub": "reference-only",
+    "epic": "not-integrated",
+    "surescripts": "not-integrated",
+    "realPatientData": "none",
+    "clinicalDeployment": "none",
+    "complianceCertification": "none"
+  }
 }
