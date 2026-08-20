@@ -1,0 +1,43 @@
+name: Clean repair scaffolding
+
+on:
+  push:
+    branches:
+      - agent/rxflow-repair
+    paths:
+      - '.github/workflows/cleanup-repair.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove one-shot transport and CI scaffolding
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .repair .rxflow-import .rxflow-import-xz .rxflow-import-safe .rxflow-import-final
+          rm -f .upload-marker
+          rm -f \
+            .github/workflows/bootstrap-build.yml \
+            .github/workflows/materialize-large-source.yml \
+            .github/workflows/modular-core-tests.yml \
+            .github/workflows/postgres17-live.yml \
+            .github/workflows/container-runtime.yml \
+            .github/workflows/supply-chain.yml \
+            .github/workflows/refresh-v060-lock.yml \
+            .github/workflows/prepare-v060-evidence.yml \
+            .github/workflows/cleanup-repair.yml
+      - name: Commit clean repository surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m 'Clean repair scaffolding for v0.6.0'
+          git push origin HEAD:agent/rxflow-repair
