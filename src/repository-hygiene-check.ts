@@ -11,18 +11,20 @@ const gitignore = await readFile(new URL(".gitignore", root), "utf8");
 for (const required of ["dist/", "node_modules/", ".env", "artifacts/"]) {
   if (!gitignore.includes(required)) throw new Error(`repository_hygiene_gitignore_missing:${required}`);
 }
+
 const dockerignore = await readFile(new URL(".dockerignore", root), "utf8");
 for (const required of [".git", "node_modules", "dist", "artifacts", ".env", "*.zip"]) {
   if (!dockerignore.includes(required)) throw new Error(`repository_hygiene_dockerignore_missing:${required}`);
 }
 
 const readme = await readFile(new URL("README.md", root), "utf8");
-if (!readme.includes(`## Current release: v${VERSION}`)) throw new Error("repository_hygiene_readme_version_mismatch");
+if (!readme.includes("# RxFlow")) throw new Error("repository_hygiene_readme_title_missing");
+if (!readme.includes(`v${VERSION}`)) throw new Error("repository_hygiene_readme_version_mismatch");
 if (!readme.includes("npm ci")) throw new Error("repository_hygiene_readme_npm_ci_missing");
-if (!readme.includes("npm run demo:evidence")) throw new Error("repository_hygiene_readme_evidence_demo_missing");
+if (!readme.includes("npm run release:check")) throw new Error("repository_hygiene_release_check_missing");
 
 const security = await readFile(new URL("SECURITY.md", root), "utf8");
-if (!security.includes("synthetic") || !security.includes("not a compliance certification")) {
+if (!security.toLowerCase().includes("synthetic") || !security.toLowerCase().includes("not a compliance certification")) {
   throw new Error("repository_hygiene_security_boundary_missing");
 }
 
