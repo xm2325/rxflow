@@ -1,0 +1,156 @@
+        actorId: redriveActor, createdAt: now, requestId: request.request_id, reasonCode: request.reason_code as DeliveryGapReasonCode, reference: request.reference
+      });
+      const updated = await client.query<OutboxRow>(`
+        UPDATE outbox SET status = 'PENDING', attempts = 0, published_at = NULL, claim_id = NULL, claimed_by = NULL, lease_until = NULL, next_attempt_at = NULL
+        WHERE event_id = $1 AND status = 'DEAD_LETTER'
+        RETURNING event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until, next_attempt_at, created_at,
+                  retired_at, retired_by, retirement_reason_code, retirement_reference, replacement_event_id, recovery_generation
+      `, [eventId]);
+      if (!updated.rows[0]) throw new Error("outbox_event_not_dead_letter");
+      if (actorId?.trim()) await this.insertRecoveryAudit(client, { auditId: randomUUID(), tenantId: tenant, eventId, recoveryGeneration: generation, action: "REDRIVEN", actorId: actorId.trim(), createdAt: now });
+      return this.mapOutboxRow(updated.rows[0]);
+    });
+  }
+
+  async retireDeadLetter(request: OutboxRetirementRequest): Promise<OutboxRetirementResult> {
+    validateRetirementIdentity(request.actorId, request.reference);
+    const now = request.now ?? new Date();
+    return await this.withTransaction(async (client) => {
+      const selected = await client.query<OutboxRow>(`
+        SELECT event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until, next_attempt_at, created_at,
+               retired_at, retired_by, retirement_reason_code, retirement_reference, replacement_event_id, recovery_generation
+        FROM outbox
+        WHERE event_id = $1 AND ($2::text IS NULL OR tenant_id = $2)
+        FOR UPDATE
+      `, [request.eventId, request.tenantId ?? null]);
+      const row = selected.rows[0];
+      if (!row) throw new Error("outbox_event_not_found");
+      const record = this.mapOutboxRow(row);
+      if (record.status !== "DEAD_LETTER") throw new Error("outbox_event_not_dead_letter");
+      if ((record.recoveryGeneration ?? 0) !== request.expectedRecoveryGeneration) throw new Error("stale_outbox_recovery");
+      const replacementEvent = buildGapEvent(record, request.reasonCode, now);
+      const updated = await client.query<OutboxRow>(`
+        UPDATE outbox
+        SET status = 'RETIRED', claim_id = NULL, claimed_by = NULL, lease_until = NULL, next_attempt_at = NULL,
+            retired_at = $3::timestamptz, retired_by = $4, retirement_reason_code = $5, retirement_reference = $6, replacement_event_id = $7
+        WHERE event_id = $1 AND status = 'DEAD_LETTER' AND ($2::text IS NULL OR tenant_id = $2)
+        RETURNING event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until, next_attempt_at, created_at,
+                  retired_at, retired_by, retirement_reason_code, retirement_reference, replacement_event_id, recovery_generation
+      `, [request.eventId, request.tenantId ?? null, now.toISOString(), request.actorId.trim(), request.reasonCode, request.reference.trim(), replacementEvent.eventId]);
+      const retiredRow = updated.rows[0];
+      if (!retiredRow) throw new Error("outbox_event_not_dead_letter");
+      await this.insertEvents(client, [replacementEvent]);
+      const replacement = await client.query<OutboxRow>(`
+        SELECT event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until, next_attempt_at, created_at,
+               retired_at, retired_by, retirement_reason_code, retirement_reference, replacement_event_id, recovery_generation
+        FROM outbox WHERE event_id = $1
+      `, [replacementEvent.eventId]);
+      if (!replacement.rows[0]) throw new Error("outbox_retirement_failed");
+      return { retired: this.mapOutboxRow(retiredRow), replacement: this.mapOutboxRow(replacement.rows[0]) };
+    });
+  }
+
+  async createRetirementApprovalRequest(request: Omit<OutboxRetirementApprovalRequest, "requestId" | "status" | "requestedAt"> & { now?: Date }): Promise<OutboxRetirementApprovalRequest> {
+    validateRetirementIdentity(request.requestedBy, request.reference);
+    const now = request.now ?? new Date();
+    return await this.withTransaction(async (client) => {
+      const selected = await client.query<OutboxRow>(`
+        SELECT event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until, next_attempt_at, created_at,
+               retired_at, retired_by, retirement_reason_code, retirement_reference, replacement_event_id, recovery_generation
+        FROM outbox WHERE event_id = $1 AND tenant_id = $2 FOR UPDATE
+      `, [request.eventId, request.tenantId]);
+      const row = selected.rows[0];
+      if (!row) throw new Error("outbox_event_not_found");
+      const record = this.mapOutboxRow(row);
+      if (record.status !== "DEAD_LETTER") throw new Error("outbox_event_not_dead_letter");
+      if ((record.recoveryGeneration ?? 0) !== request.recoveryGeneration) throw new Error("stale_outbox_recovery");
+      if (record.event.type === "DeliveryGapDeclared") throw new Error("gap_event_cannot_be_retired");
+      if (!Number.isInteger(record.event.aggregateSequence) || (record.event.aggregateSequence ?? 0) < 1) throw new Error("outbox_event_not_ordered");
+      const requestId = randomUUID();
+      try {
+        await client.query(`
+          INSERT INTO outbox_retirement_requests(
+            request_id, tenant_id, event_id, recovery_generation, requested_by, reason_code, reference, status, requested_at
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING',$8::timestamptz)
+        `, [requestId, request.tenantId, request.eventId, request.recoveryGeneration, request.requestedBy.trim(), request.reasonCode, request.reference.trim(), now.toISOString()]);
+      } catch (error) {
+        if (typeof error === "object" && error !== null && (error as { code?: unknown }).code === "23505") throw new Error("retirement_request_exists");
+        throw error;
+      }
+      const created: OutboxRetirementApprovalRequest = {
+        requestId, tenantId: request.tenantId, eventId: request.eventId, recoveryGeneration: request.recoveryGeneration,
+        requestedBy: request.requestedBy.trim(), reasonCode: request.reasonCode, reference: request.reference.trim(),
+        status: "PENDING", requestedAt: now.toISOString()
+      };
+      await this.insertRecoveryAudit(client, {
+        auditId: randomUUID(), tenantId: created.tenantId, eventId: created.eventId, recoveryGeneration: created.recoveryGeneration,
+        action: "RETIREMENT_REQUESTED", actorId: created.requestedBy, createdAt: created.requestedAt, requestId,
+        reasonCode: created.reasonCode, reference: created.reference
+      });
+      return created;
+    });
+  }
+
+  async approveRetirementApprovalRequest(requestId: string, approverId: string, tenantId?: string, now = new Date()): Promise<OutboxRetirementApprovalResult> {
+    if (!approverId.trim()) throw new Error("retirement_approver_required");
+    return await this.withTransaction(async (client) => {
+      // Read the request identity without a row lock, then acquire durable locks
+      // in the same order used by redrive: outbox row first, request row second.
+      // This avoids an approve(request→outbox) / redrive(outbox→request) deadlock.
+      const requestIdentity = await client.query<RetirementRequestRow>(`
+        SELECT request_id, tenant_id, event_id, recovery_generation, requested_by, reason_code, reference, status, requested_at,
+               approved_by, approved_at, replacement_event_id, superseded_by, superseded_at
+        FROM outbox_retirement_requests
+        WHERE request_id = $1 AND ($2::text IS NULL OR tenant_id = $2)
+      `, [requestId, tenantId ?? null]);
+      const identityRow = requestIdentity.rows[0];
+      if (!identityRow) throw new Error("retirement_request_not_found");
+      const identity = this.mapRetirementRequestRow(identityRow);
+
+      const selectedEvent = await client.query<OutboxRow>(`
+        SELECT event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until, next_attempt_at, created_at,
+               retired_at, retired_by, retirement_reason_code, retirement_reference, replacement_event_id, recovery_generation
+        FROM outbox WHERE event_id = $1 AND tenant_id = $2 FOR UPDATE
+      `, [identity.eventId, identity.tenantId]);
+
+      const selectedRequest = await client.query<RetirementRequestRow>(`
+        SELECT request_id, tenant_id, event_id, recovery_generation, requested_by, reason_code, reference, status, requested_at,
+               approved_by, approved_at, replacement_event_id, superseded_by, superseded_at
+        FROM outbox_retirement_requests
+        WHERE request_id = $1 AND tenant_id = $2 FOR UPDATE
+      `, [requestId, identity.tenantId]);
+      const requestRow = selectedRequest.rows[0];
+      if (!requestRow) throw new Error("retirement_request_not_found");
+      const request = this.mapRetirementRequestRow(requestRow);
+      if (request.eventId !== identity.eventId || request.recoveryGeneration !== identity.recoveryGeneration) throw new Error("stale_outbox_recovery");
+      if (request.status !== "PENDING") throw new Error("retirement_request_not_pending");
+      if (request.requestedBy === approverId.trim()) throw new Error("retirement_separation_of_duties");
+      const eventRow = selectedEvent.rows[0];
+      if (!eventRow) throw new Error("outbox_event_not_found");
+      const record = this.mapOutboxRow(eventRow);
+      if (record.status !== "DEAD_LETTER") throw new Error("outbox_event_not_dead_letter");
+      if ((record.recoveryGeneration ?? 0) !== request.recoveryGeneration) throw new Error("stale_outbox_recovery");
+      const replacementEvent = buildGapEvent(record, request.reasonCode, now);
+      const updated = await client.query<OutboxRow>(`
+        UPDATE outbox
+        SET status = 'RETIRED', claim_id = NULL, claimed_by = NULL, lease_until = NULL, next_attempt_at = NULL,
+            retired_at = $2::timestamptz, retired_by = $3, retirement_reason_code = $4, retirement_reference = $5, replacement_event_id = $6
+        WHERE event_id = $1 AND status = 'DEAD_LETTER' AND recovery_generation = $7
+        RETURNING event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until, next_attempt_at, created_at,
+                  retired_at, retired_by, retirement_reason_code, retirement_reference, replacement_event_id, recovery_generation
+      `, [request.eventId, now.toISOString(), approverId.trim(), request.reasonCode, request.reference, replacementEvent.eventId, request.recoveryGeneration]);
+      if (!updated.rows[0]) throw new Error("stale_outbox_recovery");
+      await this.insertEvents(client, [replacementEvent]);
+      const approved = await client.query<RetirementRequestRow>(`
+        UPDATE outbox_retirement_requests
+        SET status='APPROVED', approved_by=$2, approved_at=$3::timestamptz, replacement_event_id=$4
+        WHERE request_id=$1 AND status='PENDING'
+        RETURNING request_id, tenant_id, event_id, recovery_generation, requested_by, reason_code, reference, status, requested_at, approved_by, approved_at, replacement_event_id, superseded_by, superseded_at
+      `, [requestId, approverId.trim(), now.toISOString(), replacementEvent.eventId]);
+      if (!approved.rows[0]) throw new Error("retirement_request_not_pending");
+      await this.insertRecoveryAudit(client, {
+        auditId: randomUUID(), tenantId: request.tenantId, eventId: request.eventId, recoveryGeneration: request.recoveryGeneration,
+        action: "RETIREMENT_APPROVED", actorId: approverId.trim(), createdAt: now.toISOString(), requestId, reasonCode: request.reasonCode,
+        reference: request.reference, replacementEventId: replacementEvent.eventId
+      });
+      const replacement = await client.query<OutboxRow>(`
