@@ -71,7 +71,6 @@ function detachedCase(rxCase: RxCase): RxCase {
   return JSON.parse(JSON.stringify(rxCase)) as RxCase;
 }
 
-
 function deterministicPaRule(payerPlan: string, medicationCode: string): boolean {
   const digest = createHash("sha256").update(`${payerPlan}|${medicationCode}`).digest();
   return digest[0] % 2 === 0;
