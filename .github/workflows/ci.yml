@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - agent/rxflow-repair
+      - agent/v0.9-review-governance
   pull_request:
 
 permissions:
