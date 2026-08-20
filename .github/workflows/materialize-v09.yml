@@ -1,0 +1,250 @@
+name: Materialize and validate v0.9
+
+on:
+  push:
+    branches:
+      - agent/v0.9-review-governance
+    paths:
+      - '.github/workflows/materialize-v09.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rxflow
+          POSTGRES_PASSWORD: rxflow_test_password
+          POSTGRES_DB: rxflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rxflow -d rxflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RXFLOW_POSTGRES_TEST_URL: postgresql://rxflow:rxflow_test_password@127.0.0.1:5432/rxflow
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Preserve v0.6 public evidence surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          P=/tmp/rxflow-v06-preserve
+          mkdir -p "$P/.github/workflows" "$P/docs"
+          cp README.md "$P/README.md"
+          cp docs/evidence-boundaries.json "$P/docs/evidence-boundaries.json"
+          cp docs/project-evidence.md "$P/docs/project-evidence.md"
+          cp .github/workflows/ci.yml "$P/.github/workflows/ci.yml"
+          cp .github/workflows/infra.yml "$P/.github/workflows/infra.yml"
+          if [ -d docs/ci-evidence ]; then cp -a docs/ci-evidence "$P/docs/ci-evidence"; fi
+
+      - name: Verify staged manifest and patch bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object .v09/patch.part.00)" = fcbb97d31cde285198beb8910e7e61d8e61b51dd
+          test "$(git hash-object .v09/patch.part.01)" = 7b1dc309818222ea9f82c1be262d800e14be07f3
+          test "$(git hash-object .v09/patch.part.02)" = 628e98319b1280e39c8dc8c4429431d1f84693f0
+          test "$(git hash-object .v09/patch.part.03)" = b3b16efd4bf7157f8523d0c21a64dca7d4fea1b3
+          test "$(git hash-object .v09/patch.part.04)" = 3387cd7c662aa2bdd3cc2963173a8c755bd43c17
+          cat .v09/patch.part.* > /tmp/v09.patch.gz.b64
+          echo 'b8ba50f50c5d2cde28a4b5b879d9e174f11af0337b2a57dc13816de1cdd38687  /tmp/v09.patch.gz.b64' | sha256sum -c -
+          base64 -d /tmp/v09.patch.gz.b64 > /tmp/v09.patch.gz
+          echo '18f0229769dc291699d39c23ae3f3ef27c14f75bd4d9cb219edbcffce447ab46  /tmp/v09.patch.gz' | sha256sum -c -
+          gzip -dc /tmp/v09.patch.gz > /tmp/v09.patch
+          echo 'da41da238e11cbe19c82281cf212782e3e91d657d84d0b04aab0bdfa8e6d5b6d  /tmp/v09.patch' | sha256sum -c -
+          python3 - <<'PY'
+          import json
+          m=json.load(open('.v09/manifest.json'))
+          assert len(m)==192, len(m)
+          paths=[x['path'] for x in m]
+          assert len(paths)==len(set(paths))
+          lookup={x['path']:x['sha'] for x in m}
+          expected={
+            'src/store.ts':'58e32b7147a2dfba94bcfdec2d8e2c5a6dd3f24c',
+            'src/workflow.ts':'c986b923b0d004668b9d10e4684ec8097dc3bf7d',
+            'src/server.ts':'7fcc0319775bfd732c45a8aed227f3efb560c0f3',
+            'package-lock.json':'e64ec1478b3a013e9fc4efcf1042ef847ae0c374',
+            'docs/openapi.json':'7e6217c68ceb85214be04e6a882e04265f3cdd50',
+            'scripts/release-check.mjs':'1eb77ef803588b7c650d6d4e5c7e8a2d1f1c14e6'
+          }
+          for p,s in expected.items(): assert lookup.get(p)==s, (p,lookup.get(p))
+          print({'manifestFiles':len(m),'criticalShaChecks':len(expected)})
+          PY
+
+      - name: Materialize exact clean source blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64,json,os,pathlib,urllib.request
+          manifest=json.load(open('.v09/manifest.json'))
+          root=pathlib.Path('/tmp/rxflow-v09-stage')
+          root.mkdir(parents=True,exist_ok=True)
+          api=os.environ.get('GITHUB_API_URL','https://api.github.com')
+          repo=os.environ['GITHUB_REPOSITORY']
+          token=os.environ['GH_TOKEN']
+          headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          for item in manifest:
+              req=urllib.request.Request(f"{api}/repos/{repo}/git/blobs/{item['sha']}",headers=headers)
+              with urllib.request.urlopen(req) as r: blob=json.load(r)
+              if blob.get('encoding')!='base64': raise SystemExit(f"unexpected_encoding:{item['path']}")
+              data=base64.b64decode(blob['content'])
+              out=root/item['path']; out.parent.mkdir(parents=True,exist_ok=True); out.write_bytes(data)
+          print({'materializedFiles':len(manifest)})
+          PY
+          P=/tmp/rxflow-v06-preserve
+          S=/tmp/rxflow-v09-stage
+          cp "$P/README.md" "$S/README.md"
+          cp "$P/docs/evidence-boundaries.json" "$S/docs/evidence-boundaries.json"
+          cp "$P/docs/project-evidence.md" "$S/docs/project-evidence.md"
+          cp "$P/.github/workflows/ci.yml" "$S/.github/workflows/ci.yml"
+          cp "$P/.github/workflows/infra.yml" "$S/.github/workflows/infra.yml"
+          if [ -d "$P/docs/ci-evidence" ]; then cp -a "$P/docs/ci-evidence" "$S/docs/ci-evidence"; fi
+
+      - name: Apply locally validated v0.9 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          S=/tmp/rxflow-v09-stage
+          cd "$S"
+          git init -q
+          git apply --check /tmp/v09.patch
+          git apply /tmp/v09.patch
+
+      - name: Upgrade retained v0.6 public metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib
+          S=pathlib.Path('/tmp/rxflow-v09-stage')
+          p=S/'package.json'; pkg=json.loads(p.read_text())
+          pkg['version']='0.9.0'
+          pkg['description']='Synthetic specialty-pharmacy workflow reliability platform with governed human review, FHIR ingestion, and durable outbox delivery.'
+          pkg['packageManager']='npm@10.9.2'
+          scripts=pkg.setdefault('scripts',{})
+          scripts['release:check']='node scripts/release-check.mjs'
+          scripts['test:review-governance']='npm run build && node --test dist/test/review-governance.test.js'
+          scripts['test:http:review-governance']='npm run build && node integration/review-governance-http.mjs'
+          scripts['test:postgres:review-governance']='npm run build && node integration/review-governance-postgres.mjs'
+          p.write_text(json.dumps(pkg,indent=2)+'\n')
+
+          readme=(S/'README.md').read_text().replace('## v0.6.0','## v0.9.0',1)
+          section='''\n## Review governance (v0.9.0)\n\nHuman review is an explicit state machine: a reviewer claims a case under a bounded lease; public decisions use both `If-Match` and a durable `X-Idempotency-Key`; a low-confidence draft that is materially edited enters a second-approval queue; and that second approval must come from a different reviewer. A durable receipt records reviewer identities, version transition, timestamp, and a SHA-256 answer hash while operations views remain data-minimised.\n\nThe full release contract is `npm run release:check`. Review-governance storage behavior is exercised in the unit suite and PostgreSQL 17 CI. This remains synthetic engineering evidence, not a clinical deployment or compliance certification.\n'''
+          if '## Review governance (v0.9.0)' not in readme: readme += section
+          if 'npm run release:check' not in readme: readme += '\n```bash\nnpm run release:check\n```\n'
+          (S/'README.md').write_text(readme)
+
+          epath=S/'docs/evidence-boundaries.json'; evidence=json.loads(epath.read_text())
+          evidence['releaseVersion']='0.9.0'
+          evidence.setdefault('evidenceStatus',{})['reviewGovernance']='executed-local-inmemory-sqlite-http'
+          evidence.setdefault('statuses',{})['reviewGovernance']='executed-local-inmemory-sqlite-http'
+          claims=evidence.setdefault('publicClaims',[])
+          claim='Synthetic review governance is exercised locally across in-memory, SQLite, and HTTP integration tests; PostgreSQL 17 is promoted only after CI observation.'
+          if claim not in claims: claims.append(claim)
+          epath.write_text(json.dumps(evidence,indent=2)+'\n')
+
+          project=S/'docs/project-evidence.md'; text=project.read_text()
+          if '## Governed human review' not in text:
+              text += '''\n## Governed human review\n\nVersion 0.9 adds review ownership leases, optimistic concurrency, durable decision idempotency, low-confidence edit escalation, second-review separation of duties, and bounded decision receipts. PostgreSQL 17 execution is described as observed only when the corresponding CI evidence file is present.\n'''
+          project.write_text(text)
+
+          changelog=S/'CHANGELOG.md'; c=changelog.read_text()
+          if '## v0.9.0' not in c:
+              c='''## v0.9.0\n\n- Added bounded review claims and reviewer ownership.\n- Added durable review-decision idempotency alongside ETag concurrency.\n- Added second approval for low-confidence edited drafts with reviewer separation of duties.\n- Added data-minimised governance views, decision receipts, and PostgreSQL 17 governance tests.\n\n'''+c
+          changelog.write_text(c)
+
+          adr=S/'docs/adr/0061-governed-human-review.md'
+          adr.write_text('''# ADR 0061: Governed human review\n\n## Decision\n\nHuman review uses a bounded ownership lease plus optimistic case-version preconditions. Public decisions also require a durable idempotency key. Material edits to low-confidence drafts are not routed by one reviewer: they enter a second-approval queue, and the second reviewer must differ from the requester.\n\nThe decision binding, case transition, and outbox events commit in the same storage transaction. Successful retries return the durable winner; conflicting reuse of a decision key is rejected. Operations surfaces expose ownership and receipt metadata but not proposed or final answer text.\n\n## Evidence boundary\n\nThese controls are exercised with synthetic data. They are engineering controls, not evidence of clinical deployment or compliance certification.\n''')
+
+          wf=S/'.github/workflows/review-governance.yml'; wf.parent.mkdir(parents=True,exist_ok=True)
+          wf.write_text('''name: review-governance\n\non:\n  push:\n  pull_request:\n\njobs:\n  governance:\n    runs-on: ubuntu-latest\n    services:\n      postgres:\n        image: postgres:17\n        env:\n          POSTGRES_USER: rxflow\n          POSTGRES_PASSWORD: rxflow_test_password\n          POSTGRES_DB: rxflow\n        ports:\n          - 5432:5432\n        options: >-\n          --health-cmd "pg_isready -U rxflow -d rxflow"\n          --health-interval 5s\n          --health-timeout 5s\n          --health-retries 20\n    env:\n      RXFLOW_POSTGRES_TEST_URL: postgresql://rxflow:rxflow_test_password@127.0.0.1:5432/rxflow\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 22\n          cache: npm\n      - run: npm ci --ignore-scripts --no-audit --no-fund\n      - run: npm run test:review-governance\n      - run: npm run test:http:review-governance\n      - run: npm run test:postgres:review-governance\n''')
+          PY
+
+      - name: Clean install and full release contract
+        working-directory: /tmp/rxflow-v09-stage
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run release:check
+
+      - name: PostgreSQL 17 live contracts
+        working-directory: /tmp/rxflow-v09-stage
+        run: |
+          npm run test:postgres:live
+          npm run test:postgres:review-governance
+
+      - name: Container and dependency gates
+        working-directory: /tmp/rxflow-v09-stage
+        run: |
+          docker build -t rxflow:v0.9.0 .
+          docker run --rm --entrypoint=node rxflow:v0.9.0 -e "if (process.getuid && process.getuid() === 0) process.exit(1); console.log('non-root-runtime-ok')"
+          npm audit --audit-level=high --omit=dev
+
+      - name: Promote PostgreSQL governance to observed CI evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib
+          S=pathlib.Path('/tmp/rxflow-v09-stage')
+          epath=S/'docs/evidence-boundaries.json'; evidence=json.loads(epath.read_text())
+          status='executed-in-ci-inmemory-sqlite-http-postgres17'
+          evidence.setdefault('evidenceStatus',{})['reviewGovernance']=status
+          evidence.setdefault('statuses',{})['reviewGovernance']=status
+          claims=evidence.setdefault('publicClaims',[])
+          local='Synthetic review governance is exercised locally across in-memory, SQLite, and HTTP integration tests; PostgreSQL 17 is promoted only after CI observation.'
+          if local in claims: claims.remove(local)
+          ci='Synthetic review governance is exercised across in-memory, SQLite, HTTP integration, and PostgreSQL 17 CI.'
+          if ci not in claims: claims.append(ci)
+          epath.write_text(json.dumps(evidence,indent=2)+'\n')
+          release=json.loads((S/'docs/release-evidence-v0.9.0.json').read_text())
+          out=S/'docs/ci-evidence/review-governance-v0.9.0.json'; out.parent.mkdir(parents=True,exist_ok=True)
+          out.write_text(json.dumps({
+            'version':'0.9.0','status':'passed','releaseTests':release.get('tests'),
+            'coverage':release.get('coverage'),
+            'contracts':{
+              'reviewClaimLease':True,'optimisticConcurrency':True,'durableDecisionIdempotency':True,
+              'lowConfidenceEditSecondApproval':True,'differentSecondReviewerRequired':True,
+              'decisionReceipt':True,'dataMinimisedOperationsView':True,'postgres17':True,
+              'concurrentPrimaryReplay':True,'concurrentSecondApprovalReplay':True,'transactionalOutbox':True
+            },
+            'evidenceBoundary':'synthetic workflow only; no real patient data, clinical deployment, Epic/Surescripts integration, or compliance certification'
+          },indent=2)+'\n')
+          project=S/'docs/project-evidence.md'; text=project.read_text()
+          text += '\nObserved v0.9 CI evidence includes the PostgreSQL 17 governed-review scenario when `docs/ci-evidence/review-governance-v0.9.0.json` is present.\n'
+          project.write_text(text)
+          PY
+          cd /tmp/rxflow-v09-stage
+          npm run check:evidence
+          npm run release:check
+
+      - name: Replace feature branch with validated clean tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          S=/tmp/rxflow-v09-stage
+          rm -rf "$S/.git"
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$S"/. .
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m "Add v0.9.0 governed human review workflow"
+          git push origin HEAD:agent/v0.9-review-governance
