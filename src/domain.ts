@@ -4,6 +4,7 @@ export type WorkflowStatus =
   | "PA_NOT_REQUIRED"
   | "PA_DRAFT_PENDING"
   | "HUMAN_REVIEW_REQUIRED"
+  | "SECOND_APPROVAL_REQUIRED"
   | "PA_APPROVED"
   | "ROUTED"
   | "FAILED_RETRYABLE"
@@ -29,31 +30,40 @@ export interface AuditEvent {
   details: Record<string, string | number | boolean>;
 }
 
+
+export interface HumanReviewDecision {
+  reviewer: string;
+  edited: boolean;
+  finalAnswer: string;
+  reviewedAt: string;
+  secondReviewer?: string;
+  secondReviewedAt?: string;
+}
+
 export interface ReviewClaim {
+  claimId: string;
   reviewer: string;
   claimedAt: string;
   leaseUntil: string;
 }
 
-export interface ReviewEscalation {
-  escalationId: string;
-  requestedBy: string;
-  requestedAt: string;
-  proposedAnswer: string;
-  reason: "LOW_CONFIDENCE_EDIT";
-  baseVersion: number;
+export type ReviewReceiptOutcome = "ROUTED" | "SECOND_APPROVAL_REQUIRED" | "ROUTED_AFTER_SECOND_APPROVAL";
+
+export interface ReviewDecisionReceipt {
+  receiptId: string;
+  outcome: ReviewReceiptOutcome;
+  reviewer: string;
+  caseVersion: number;
+  edited: boolean;
+  createdAt: string;
+  secondReviewer?: string;
 }
 
-export interface HumanReviewDecision {
-  decisionId: string;
-  reviewer: string;
-  secondReviewer?: string;
-  edited: boolean;
-  finalAnswer: string;
-  answerHash: string;
-  reviewedAt: string;
-  committedFromVersion: number;
-  committedToVersion: number;
+export interface ReviewEscalation {
+  requestedBy: string;
+  requestedAt: string;
+  reasonCode: "LOW_CONFIDENCE_EDIT";
+  proposedAnswer: string;
 }
 
 export interface WorkflowFailure {
@@ -80,9 +90,10 @@ export interface RxCase {
   status: WorkflowStatus;
   priorAuthRequired: boolean | null;
   paDraft?: PriorAuthDraft;
-  reviewClaim?: ReviewClaim;
-  reviewEscalation?: ReviewEscalation;
   reviewDecision?: HumanReviewDecision;
+  reviewClaim?: ReviewClaim;
+  reviewReceipts?: ReviewDecisionReceipt[];
+  reviewEscalation?: ReviewEscalation;
   failure?: WorkflowFailure;
   audit: AuditEvent[];
 }
