@@ -20,6 +20,7 @@ export function validateEvidenceStatuses(registry: EvidenceRegistry): void {
     containerRuntime: "executed-in-ci",
     supplyChainAudit: "executed-in-ci",
     terraformValidation: "executed-in-ci",
+    workflowGovernanceCoverage: "executed-in-ci",
     cloudRunCloudSqlPubSub: "reference-only",
     epic: "not-integrated",
     surescripts: "not-integrated",

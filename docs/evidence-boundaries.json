@@ -9,6 +9,7 @@
     "containerRuntime": "executed-in-ci",
     "supplyChainAudit": "executed-in-ci",
     "terraformValidation": "executed-in-ci",
+    "workflowGovernanceCoverage": "executed-in-ci",
     "cloudRunCloudSqlPubSub": "reference-only",
     "epic": "not-integrated",
     "surescripts": "not-integrated",
@@ -37,6 +38,7 @@
     "Container build, compiled-runtime load, and non-root execution validated in GitHub Actions",
     "Dependency audit and CycloneDX SBOM generation executed in GitHub Actions",
     "Terraform formatting, initialization, and validation executed in GitHub Actions; GCP remains a reference target only",
+    "Workflow governance coverage is gated in GitHub Actions at 70% lines, 55% branches, and 75% functions; observed workflow.js coverage was 73.75% lines, 60.81% branches, and 80.77% functions",
     "Epic and Surescripts are not integrated",
     "Synthetic fixtures only; no real-world patient records are used and the project is not clinically deployed"
   ],
@@ -46,6 +48,7 @@
     "containerRuntime": "executed-in-ci",
     "supplyChainAudit": "executed-in-ci",
     "terraformValidation": "executed-in-ci",
+    "workflowGovernanceCoverage": "executed-in-ci",
     "cloudRunCloudSqlPubSub": "reference-only",
     "epic": "not-integrated",
     "surescripts": "not-integrated",

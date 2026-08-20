@@ -4,7 +4,9 @@ RxFlow is an independent synthetic healthcare software-engineering project. This
 
 ## Observed in GitHub Actions
 
-For the v0.9.0 release-candidate branch, GitHub Actions has exercised the modular workflow/FHIR/outbox/configuration contracts, the review-governance state machine, the full HTTP governance smoke, PostgreSQL 17 live integration, container build and non-root runtime checks, dependency audit/SBOM generation, and Terraform formatting/initialisation/validation.
+For the v0.9.0 release-candidate branch, GitHub Actions has exercised the modular workflow/FHIR/outbox/configuration contracts, the review-governance state machine, the full HTTP governance smoke, PostgreSQL 17 live integration, container build and non-root runtime checks, dependency audit/SBOM generation, Terraform formatting/initialisation/validation, and a dedicated workflow-governance coverage gate.
+
+The workflow coverage gate requires at least 70% line coverage, 55% branch coverage, and 75% function coverage for `dist/src/workflow.js`. On the observed GitHub Actions run used to promote this evidence state, the measured coverage was 73.75% lines, 60.81% branches, and 80.77% functions.
 
 The machine-readable status for these boundaries is maintained in `docs/evidence-boundaries.json`. A status of `executed-in-ci` means the corresponding contract has been observed on the GitHub Actions runner for this release-candidate line; it does not imply a production deployment.
 
