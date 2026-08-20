@@ -1,0 +1,246 @@
+import { randomUUID } from "node:crypto";
+import type { RxCase, WorkflowStatus } from "./domain.js";
+import type { ClaimedOutboxRecord, DeliveryGapReasonCode, IntegrationEvent, OutboxRecord, OutboxStatus } from "./events.js";
+import { IdempotencyKeyAlreadyBoundError, type CaseStore, type IdempotencyLookup, type OutboxCounts, type OutboxPressure, type OutboxRecoveryAuditAction, type OutboxRecoveryAuditEntry, type OutboxRetirementApprovalRequest, type OutboxRetirementApprovalResult, type OutboxRetirementRequest, type OutboxRetirementResult } from "./store.js";
+
+export interface PgQueryResult<Row = Record<string, unknown>> {
+  rows: Row[];
+  rowCount?: number | null;
+}
+
+export interface PgClientLike {
+  query<Row = Record<string, unknown>>(text: string, params?: readonly unknown[]): Promise<PgQueryResult<Row>>;
+  release(): void;
+}
+
+export interface PgPoolLike {
+  query<Row = Record<string, unknown>>(text: string, params?: readonly unknown[]): Promise<PgQueryResult<Row>>;
+  connect(): Promise<PgClientLike>;
+  end?(): Promise<void>;
+}
+
+export const POSTGRES_SCHEMA_VERSION = 9;
+
+export const POSTGRES_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS rxflow_schema_migrations (
+  version INTEGER PRIMARY KEY,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS cases (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  version INTEGER NOT NULL CHECK (version >= 1),
+  status TEXT NOT NULL,
+  case_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS idempotency (
+  key TEXT NOT NULL,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+  request_fingerprint TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS outbox (
+  event_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  aggregate_case_id TEXT,
+  aggregate_sequence INTEGER,
+  event_json JSONB NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('PENDING','IN_FLIGHT','PUBLISHED','DEAD_LETTER','RETIRED')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  last_error TEXT,
+  published_at TIMESTAMPTZ,
+  claim_id TEXT,
+  claimed_by TEXT,
+  lease_until TIMESTAMPTZ,
+  next_attempt_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  retired_at TIMESTAMPTZ,
+  retired_by TEXT,
+  retirement_reason_code TEXT,
+  retirement_reference TEXT,
+  replacement_event_id TEXT,
+  recovery_generation INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS outbox_retirement_requests (
+  request_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  recovery_generation INTEGER NOT NULL CHECK (recovery_generation >= 1),
+  requested_by TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  reference TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('PENDING','APPROVED','SUPERSEDED')),
+  requested_at TIMESTAMPTZ NOT NULL,
+  approved_by TEXT,
+  approved_at TIMESTAMPTZ,
+  replacement_event_id TEXT,
+  superseded_by TEXT,
+  superseded_at TIMESTAMPTZ,
+  UNIQUE(tenant_id, event_id, recovery_generation)
+);
+
+CREATE TABLE IF NOT EXISTS outbox_recovery_audit (
+  audit_id TEXT PRIMARY KEY,
+  audit_sequence INTEGER NOT NULL,
+  tenant_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  recovery_generation INTEGER NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('REDRIVEN','RETIREMENT_REQUESTED','RETIREMENT_APPROVED','RETIREMENT_SUPERSEDED')),
+  actor_id TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  request_id TEXT,
+  reason_code TEXT,
+  reference TEXT,
+  replacement_event_id TEXT,
+  UNIQUE(tenant_id, event_id, audit_sequence)
+);
+
+-- v2 adds relational tenant columns to existing v1 installations. Values are
+-- backfilled from the durable JSON records so legacy/default and tenant-aware
+-- cases can be migrated without rewriting application-level identifiers.
+ALTER TABLE cases ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+UPDATE cases
+SET tenant_id = COALESCE(NULLIF(case_json->>'tenantId', ''), 'default')
+WHERE tenant_id IS NULL;
+ALTER TABLE cases ALTER COLUMN tenant_id SET DEFAULT 'default';
+ALTER TABLE cases ALTER COLUMN tenant_id SET NOT NULL;
+
+ALTER TABLE idempotency ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+UPDATE idempotency AS i
+SET tenant_id = COALESCE(c.tenant_id, 'default')
+FROM cases AS c
+WHERE i.case_id = c.id AND i.tenant_id IS NULL;
+UPDATE idempotency SET tenant_id = 'default' WHERE tenant_id IS NULL;
+ALTER TABLE idempotency ALTER COLUMN tenant_id SET DEFAULT 'default';
+ALTER TABLE idempotency ALTER COLUMN tenant_id SET NOT NULL;
+
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+UPDATE outbox
+SET tenant_id = COALESCE(NULLIF(event_json->>'tenantId', ''), 'default')
+WHERE tenant_id IS NULL;
+ALTER TABLE outbox ALTER COLUMN tenant_id SET DEFAULT 'default';
+ALTER TABLE outbox ALTER COLUMN tenant_id SET NOT NULL;
+
+-- v3 makes the external idempotency key tenant-local in storage. v0.0.65-v0.0.69
+-- encoded non-default tenant identity into the key string; strip that legacy
+-- prefix once, then enforce the relational (tenant_id, key) primary key.
+DO $$
+DECLARE
+  pk_columns TEXT;
+BEGIN
+  SELECT string_agg(a.attname, ',' ORDER BY u.ordinality)
+  INTO pk_columns
+  FROM pg_constraint AS c
+  CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS u(attnum, ordinality)
+  JOIN pg_attribute AS a ON a.attrelid = c.conrelid AND a.attnum = u.attnum
+  WHERE c.conrelid = 'public.idempotency'::regclass AND c.contype = 'p';
+
+  IF pk_columns IS DISTINCT FROM 'tenant_id,key' THEN
+    ALTER TABLE idempotency DROP CONSTRAINT IF EXISTS idempotency_pkey;
+    UPDATE idempotency
+    SET key = substring(key FROM length(tenant_id) + 2)
+    WHERE key LIKE tenant_id || chr(31) || '%';
+    ALTER TABLE idempotency ADD CONSTRAINT idempotency_pkey PRIMARY KEY (tenant_id, key);
+  END IF;
+END $$;
+
+-- v4 makes aggregate ordering relational so the dispatcher can enforce
+-- head-of-line delivery without parsing JSON inside queue ownership logic.
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS aggregate_case_id TEXT;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS aggregate_sequence INTEGER;
+UPDATE outbox
+SET aggregate_case_id = event_json->>'caseId',
+    aggregate_sequence = CASE
+      WHEN (event_json->>'aggregateSequence') ~ '^[0-9]+$' THEN (event_json->>'aggregateSequence')::integer
+      ELSE NULL
+    END
+WHERE aggregate_case_id IS NULL OR aggregate_sequence IS NULL;
+
+-- v5 adds explicit retirement metadata for operator-declared delivery gaps.
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS retired_at TIMESTAMPTZ;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS retired_by TEXT;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS retirement_reason_code TEXT;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS retirement_reference TEXT;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS replacement_event_id TEXT;
+ALTER TABLE outbox DROP CONSTRAINT IF EXISTS outbox_status_check;
+ALTER TABLE outbox ADD CONSTRAINT outbox_status_check CHECK (status IN ('PENDING','IN_FLIGHT','PUBLISHED','DEAD_LETTER','RETIRED')) NOT VALID;
+ALTER TABLE outbox VALIDATE CONSTRAINT outbox_status_check;
+
+-- v6 versions dead-letter recovery cycles so stale operator actions cannot target a newer failure.
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS recovery_generation INTEGER NOT NULL DEFAULT 0;
+
+-- v7 adds durable two-person retirement requests and recovery audit history.
+CREATE TABLE IF NOT EXISTS outbox_retirement_requests (
+  request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_id TEXT NOT NULL, recovery_generation INTEGER NOT NULL CHECK (recovery_generation >= 1),
+  requested_by TEXT NOT NULL, reason_code TEXT NOT NULL, reference TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('PENDING','APPROVED')),
+  requested_at TIMESTAMPTZ NOT NULL, approved_by TEXT, approved_at TIMESTAMPTZ, replacement_event_id TEXT,
+  UNIQUE(tenant_id, event_id, recovery_generation)
+);
+CREATE TABLE IF NOT EXISTS outbox_recovery_audit (
+  audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_id TEXT NOT NULL, recovery_generation INTEGER NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('REDRIVEN','RETIREMENT_REQUESTED','RETIREMENT_APPROVED','RETIREMENT_SUPERSEDED')), actor_id TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+  request_id TEXT, reason_code TEXT, reference TEXT, replacement_event_id TEXT
+);
+
+-- v8 gives stale two-person recovery proposals an explicit lifecycle state.
+ALTER TABLE outbox_retirement_requests ADD COLUMN IF NOT EXISTS superseded_by TEXT;
+ALTER TABLE outbox_retirement_requests ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
+ALTER TABLE outbox_retirement_requests DROP CONSTRAINT IF EXISTS outbox_retirement_requests_status_check;
+ALTER TABLE outbox_retirement_requests ADD CONSTRAINT outbox_retirement_requests_status_check CHECK (status IN ('PENDING','APPROVED','SUPERSEDED')) NOT VALID;
+ALTER TABLE outbox_retirement_requests VALIDATE CONSTRAINT outbox_retirement_requests_status_check;
+ALTER TABLE outbox_recovery_audit DROP CONSTRAINT IF EXISTS outbox_recovery_audit_action_check;
+ALTER TABLE outbox_recovery_audit ADD CONSTRAINT outbox_recovery_audit_action_check CHECK (action IN ('REDRIVEN','RETIREMENT_REQUESTED','RETIREMENT_APPROVED','RETIREMENT_SUPERSEDED')) NOT VALID;
+ALTER TABLE outbox_recovery_audit VALIDATE CONSTRAINT outbox_recovery_audit_action_check;
+
+-- v9 adds a durable causal sequence because timestamps can collide inside one transaction.
+ALTER TABLE outbox_recovery_audit ADD COLUMN IF NOT EXISTS audit_sequence INTEGER;
+WITH ranked AS (
+  SELECT audit_id, ROW_NUMBER() OVER (PARTITION BY tenant_id,event_id ORDER BY created_at,audit_id) AS seq
+  FROM outbox_recovery_audit
+)
+UPDATE outbox_recovery_audit AS a SET audit_sequence = ranked.seq
+FROM ranked WHERE a.audit_id = ranked.audit_id AND a.audit_sequence IS NULL;
+ALTER TABLE outbox_recovery_audit ALTER COLUMN audit_sequence SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_outbox_recovery_audit_sequence ON outbox_recovery_audit(tenant_id,event_id,audit_sequence);
+
+CREATE INDEX IF NOT EXISTS idx_cases_tenant_status ON cases(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_cases_tenant_updated ON cases(tenant_id, updated_at, id);
+CREATE INDEX IF NOT EXISTS idx_idempotency_tenant_key ON idempotency(tenant_id, key);
+CREATE INDEX IF NOT EXISTS idx_outbox_tenant_status_created ON outbox(tenant_id, status, created_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox(status, created_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_outbox_lease ON outbox(status, lease_until);
+CREATE INDEX IF NOT EXISTS idx_outbox_retry ON outbox(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_aggregate_order ON outbox(tenant_id, aggregate_case_id, aggregate_sequence, status);
+CREATE INDEX IF NOT EXISTS idx_outbox_retirement_requests_tenant_event ON outbox_retirement_requests(tenant_id, event_id, requested_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_recovery_audit_tenant_event ON outbox_recovery_audit(tenant_id, event_id, created_at, audit_id);
+
+INSERT INTO rxflow_schema_migrations(version) VALUES (1)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO rxflow_schema_migrations(version) VALUES (2)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO rxflow_schema_migrations(version) VALUES (3)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO rxflow_schema_migrations(version) VALUES (4)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO rxflow_schema_migrations(version) VALUES (5)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO rxflow_schema_migrations(version) VALUES (6)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO rxflow_schema_migrations(version) VALUES (7)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO rxflow_schema_migrations(version) VALUES (8)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO rxflow_schema_migrations(version) VALUES (9)
+ON CONFLICT (version) DO NOTHING;
+`;
+
+export const POSTGRES_VERIFY_SCHEMA_SQL = `
+SELECT
+  COALESCE((SELECT MAX(version) FROM rxflow_schema_migrations), 0) AS version,
