@@ -12,14 +12,10 @@ The codebase contains tenant-scoped idempotency, optimistic concurrency, transac
 
 ## Reference-only infrastructure
 
-`infra/gcp/` describes a reference Cloud Run / Cloud SQL / Pub/Sub target. Repository infrastructure code or Terraform validation is not evidence that a live GCP environment has been deployed.
+`infra/gcp/` describes a reference Cloud Run / Cloud SQL / Pub/Sub target. It is a reference target, not an observed deployment. Repository infrastructure code or successful Terraform validation is therefore not evidence that a live GCP environment has been deployed.
 
 ## Explicit non-claims
 
-- Epic is not integrated.
-- Surescripts is not integrated.
-- No real patient data is used.
-- No clinical deployment is claimed.
-- No HIPAA, NHS DSPT, SOC 2, or other compliance certification is claimed.
+Epic and Surescripts are not integrated. The project uses synthetic fixtures only and contains no real patient data. It is not a clinical deployment, and no HIPAA, NHS DSPT, SOC 2, or other compliance certification is claimed.
 
 Synthetic fixtures and CI scenarios are used to exercise engineering contracts without representing a production healthcare deployment.
