@@ -39,6 +39,8 @@ jobs:
       - run: npm ci
       - name: Release contract
         run: npm run release:check
+      - name: HTTP governance smoke
+        run: node integration/http-smoke.mjs
       - name: PostgreSQL 17 live contract
         run: npm run test:postgres:live
 
