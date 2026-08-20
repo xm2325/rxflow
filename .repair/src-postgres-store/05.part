@@ -1,2 +1,0 @@
-  return candidate.code === "23505" && candidate.constraint === "idempotency_pkey";
-}
