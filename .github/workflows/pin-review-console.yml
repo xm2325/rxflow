@@ -1,0 +1,86 @@
+name: Pin and validate review console
+
+on:
+  push:
+    branches:
+      - agent/v0.7-review-console
+    paths:
+      - '.github/workflows/pin-review-console.yml'
+      - 'web/**'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+      - name: Install root runtime
+        run: npm ci
+      - name: Resolve current web toolchain once
+        working-directory: web
+        run: npm install --ignore-scripts
+      - name: Pin resolved web versions exactly
+        working-directory: web
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const path = 'package.json';
+          const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+          for (const name of Object.keys(pkg.devDependencies ?? {})) {
+            const installed = JSON.parse(fs.readFileSync(`node_modules/${name}/package.json`, 'utf8'));
+            pkg.devDependencies[name] = installed.version;
+          }
+          fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          NODE
+          npm install --package-lock-only --ignore-scripts
+          rm -rf node_modules
+          npm ci
+      - name: Svelte type and accessibility checks
+        working-directory: web
+        run: npm run check
+      - name: Production build
+        working-directory: web
+        run: npm run build
+      - name: Install Playwright Chromium
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: Full-stack Playwright
+        working-directory: web
+        run: npm run test:e2e
+      - name: Record review-console evidence and exact lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/ci-evidence
+          source_sha="$(git rev-parse HEAD)"
+          node <<NODE
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('web/package.json', 'utf8'));
+          fs.writeFileSync('docs/ci-evidence/review-console.json', JSON.stringify({
+            schemaVersion: 1,
+            suite: 'review-console',
+            observedIn: 'github-actions',
+            sourceCommit: '${source_sha}',
+            framework: 'SvelteKit',
+            versions: pkg.devDependencies,
+            checks: ['svelte-check', 'production-build', 'chromium-full-stack-e2e', 'proxy-allow-list', 'security-headers', 'stale-review-ui'],
+            result: 'passed'
+          }, null, 2) + '\n');
+          NODE
+          rm -f .github/workflows/pin-review-console.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add web/package.json web/package-lock.json docs/ci-evidence/review-console.json .github/workflows/pin-review-console.yml
+          git commit -m 'Validate and pin v0.7 review console'
+          git push origin HEAD:agent/v0.7-review-console
