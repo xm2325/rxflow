@@ -1,0 +1,299 @@
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import type { RxCase, WorkflowStatus } from "./domain.js";
+import type { ClaimedOutboxRecord, DeliveryGapReasonCode, IntegrationEvent, OutboxRecord, OutboxStatus } from "./events.js";
+
+export interface IdempotencyLookup {
+  case: RxCase;
+  requestFingerprint: string;
+}
+
+export class IdempotencyKeyAlreadyBoundError extends Error {
+  constructor() {
+    super("idempotency_key_already_bound");
+    this.name = "IdempotencyKeyAlreadyBoundError";
+  }
+}
+
+export type Awaitable<T> = T | Promise<T>;
+
+export interface OutboxCounts {
+  pending: number;
+  inFlight: number;
+  published: number;
+  deadLetter: number;
+  retired: number;
+}
+
+export interface OutboxPressure {
+  pending: number;
+  activePendingTenants: number;
+  largestTenantPending: number;
+  oldestPendingAgeMs: number;
+  overduePending: number;
+  overduePendingTenants: number;
+  orderedBlockedPending: number;
+  orderedBlockedAggregates: number;
+}
+
+
+export interface OutboxRetirementRequest {
+  eventId: string;
+  actorId: string;
+  reasonCode: DeliveryGapReasonCode;
+  reference: string;
+  tenantId?: string;
+  now?: Date;
+  expectedRecoveryGeneration: number;
+}
+
+export interface OutboxRetirementResult {
+  retired: OutboxRecord;
+  replacement: OutboxRecord;
+}
+
+export type OutboxRecoveryRequestStatus = "PENDING" | "APPROVED" | "SUPERSEDED";
+
+export interface OutboxRetirementApprovalRequest {
+  requestId: string;
+  tenantId: string;
+  eventId: string;
+  recoveryGeneration: number;
+  requestedBy: string;
+  reasonCode: DeliveryGapReasonCode;
+  reference: string;
+  status: OutboxRecoveryRequestStatus;
+  requestedAt: string;
+  approvedBy?: string;
+  approvedAt?: string;
+  replacementEventId?: string;
+  supersededBy?: string;
+  supersededAt?: string;
+}
+
+export type OutboxRecoveryAuditAction = "REDRIVEN" | "RETIREMENT_REQUESTED" | "RETIREMENT_APPROVED" | "RETIREMENT_SUPERSEDED";
+
+export interface OutboxRecoveryAuditEntry {
+  auditId: string;
+  sequence: number;
+  tenantId: string;
+  eventId: string;
+  recoveryGeneration: number;
+  action: OutboxRecoveryAuditAction;
+  actorId: string;
+  createdAt: string;
+  requestId?: string;
+  reasonCode?: DeliveryGapReasonCode;
+  reference?: string;
+  replacementEventId?: string;
+  supersededBy?: string;
+  supersededAt?: string;
+}
+
+export interface OutboxRetirementApprovalResult {
+  request: OutboxRetirementApprovalRequest;
+  retired: OutboxRecord;
+  replacement: OutboxRecord;
+}
+
+export interface CaseStore {
+  get(id: string, tenantId?: string): Awaitable<RxCase | undefined>;
+  list(tenantId?: string): Awaitable<RxCase[]>;
+  save(rxCase: RxCase): Awaitable<void>;
+  createCase(rxCase: RxCase, idempotencyKey: string, requestFingerprint: string, events?: IntegrationEvent[]): Awaitable<void>;
+  saveWithOutbox(rxCase: RxCase, events: IntegrationEvent[]): Awaitable<void>;
+  saveWithOutboxIfStatus(rxCase: RxCase, expectedStatus: WorkflowStatus, events: IntegrationEvent[]): Awaitable<boolean>;
+  saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[]): Awaitable<boolean>;
+  getByIdempotencyKey(key: string, tenantId?: string): Awaitable<IdempotencyLookup | undefined>;
+  bindIdempotencyKey(key: string, caseId: string, requestFingerprint: string, tenantId?: string): Awaitable<void>;
+  listOutbox(status?: OutboxStatus, tenantId?: string): Awaitable<OutboxRecord[]>;
+  claimOutbox(workerId: string, limit: number, leaseMs: number, now?: Date, perTenantLimit?: number): Awaitable<ClaimedOutboxRecord[]>;
+  renewOutboxLease(eventId: string, claimId: string, leaseMs: number, now?: Date): Awaitable<void>;
+  deferOutboxClaim(eventId: string, claimId: string, retryDelayMs?: number, now?: Date): Awaitable<void>;
+  markOutboxPublished(eventId: string, claimId: string): Awaitable<void>;
+  markOutboxFailure(eventId: string, claimId: string, error: string, maxAttempts: number, retryDelayMs?: number, now?: Date): Awaitable<OutboxStatus>;
+  redriveDeadLetter(eventId: string, tenantId?: string, expectedRecoveryGeneration?: number, actorId?: string): Awaitable<OutboxRecord>;
+  retireDeadLetter(request: OutboxRetirementRequest): Awaitable<OutboxRetirementResult>;
+  createRetirementApprovalRequest(request: Omit<OutboxRetirementApprovalRequest, "requestId" | "status" | "requestedAt"> & { now?: Date }): Awaitable<OutboxRetirementApprovalRequest>;
+  approveRetirementApprovalRequest(requestId: string, approverId: string, tenantId?: string, now?: Date): Awaitable<OutboxRetirementApprovalResult>;
+  listRetirementApprovalRequests(tenantId?: string, eventId?: string): Awaitable<OutboxRetirementApprovalRequest[]>;
+  listOutboxRecoveryAudit(eventId: string, tenantId?: string): Awaitable<OutboxRecoveryAuditEntry[]>;
+  size(): Awaitable<number>;
+  healthCheck(): Awaitable<void>;
+  getOutboxCounts(): Awaitable<OutboxCounts>;
+  getOutboxPressure(ageTargetMs?: number, now?: Date): Awaitable<OutboxPressure>;
+}
+
+function cloneCase(rxCase: RxCase): RxCase {
+  return JSON.parse(JSON.stringify(rxCase)) as RxCase;
+}
+
+function caseTenant(rxCase: RxCase): string {
+  return rxCase.tenantId ?? "default";
+}
+
+function eventTenant(event: IntegrationEvent): string {
+  return event.tenantId ?? "default";
+}
+
+function aggregateKey(event: IntegrationEvent): string | undefined {
+  if (!Number.isInteger(event.aggregateSequence) || (event.aggregateSequence ?? 0) < 1) return undefined;
+  return `${eventTenant(event)}\u001f${event.caseId}`;
+}
+
+const IDEMPOTENCY_SEPARATOR = "\u001f";
+
+function idempotencyStorageKey(tenantId: string, externalKey: string): string {
+  return `${tenantId}${IDEMPOTENCY_SEPARATOR}${externalKey}`;
+}
+
+function legacyExternalKey(tenantId: string, storedKey: string): string {
+  const prefix = `${tenantId}${IDEMPOTENCY_SEPARATOR}`;
+  return storedKey.startsWith(prefix) ? storedKey.slice(prefix.length) : storedKey;
+}
+
+function normalizeCaseVersion(rxCase: RxCase): RxCase {
+  if (!Number.isInteger(rxCase.version) || rxCase.version < 1) rxCase.version = 1;
+  if (!Number.isInteger(rxCase.eventSequence) || rxCase.eventSequence < 0) rxCase.eventSequence = 0;
+  return rxCase;
+}
+
+interface IdempotencyRecord {
+  caseId: string;
+  requestFingerprint: string;
+}
+
+interface StoreSnapshot {
+  cases: RxCase[];
+  idempotency: Array<[string, IdempotencyRecord]>;
+  outbox: OutboxRecord[];
+  retirementRequests?: OutboxRetirementApprovalRequest[];
+  recoveryAudit?: OutboxRecoveryAuditEntry[];
+}
+
+function cloneOutboxRecord(record: OutboxRecord): OutboxRecord {
+  return {
+    ...record,
+    event: { ...record.event, payload: { ...record.event.payload } }
+  };
+}
+
+function cloneRetirementRequest(request: OutboxRetirementApprovalRequest): OutboxRetirementApprovalRequest { return { ...request }; }
+function cloneRecoveryAudit(entry: OutboxRecoveryAuditEntry): OutboxRecoveryAuditEntry { return { ...entry }; }
+
+function clearClaim(record: OutboxRecord): void {
+  record.claimId = undefined;
+  record.claimedBy = undefined;
+  record.leaseUntil = undefined;
+}
+
+function buildGapEvent(record: OutboxRecord, reasonCode: DeliveryGapReasonCode, now: Date): IntegrationEvent {
+  if (record.event.type === "DeliveryGapDeclared") throw new Error("gap_event_cannot_be_retired");
+  const sequence = record.event.aggregateSequence;
+  if (!Number.isInteger(sequence) || (sequence ?? 0) < 1) throw new Error("outbox_event_not_ordered");
+  return {
+    eventId: randomUUID(),
+    type: "DeliveryGapDeclared",
+    schemaVersion: 2,
+    occurredAt: now.toISOString(),
+    caseId: record.event.caseId,
+    correlationId: record.event.correlationId,
+    ...(record.event.tenantId ? { tenantId: record.event.tenantId } : {}),
+    aggregateSequence: sequence,
+    payload: {
+      retiredEventId: record.event.eventId,
+      originalType: record.event.type,
+      reasonCode
+    }
+  };
+}
+
+function validateRetirementIdentity(actorId: string, reference: string): void {
+  if (actorId.trim() === "") throw new Error("retirement_actor_required");
+  if (reference.trim().length < 3 || reference.trim().length > 128) throw new Error("invalid_retirement_reference");
+}
+
+function appendRecoveryAuditEntry(audit: OutboxRecoveryAuditEntry[], entry: Omit<OutboxRecoveryAuditEntry, "sequence">): OutboxRecoveryAuditEntry {
+  const sequence = audit.reduce((max, existing) => existing.tenantId === entry.tenantId && existing.eventId === entry.eventId ? Math.max(max, existing.sequence) : max, 0) + 1;
+  const persisted: OutboxRecoveryAuditEntry = { ...entry, sequence };
+  audit.push(persisted);
+  return persisted;
+}
+
+function supersedePendingRetirementRequests(
+  requests: Iterable<OutboxRetirementApprovalRequest>,
+  tenantId: string,
+  eventId: string,
+  recoveryGeneration: number,
+  actorId: string,
+  now: Date,
+  audit: OutboxRecoveryAuditEntry[]
+): void {
+  for (const request of requests) {
+    if (request.tenantId !== tenantId || request.eventId !== eventId || request.recoveryGeneration !== recoveryGeneration || request.status !== "PENDING") continue;
+    request.status = "SUPERSEDED";
+    request.supersededBy = actorId;
+    request.supersededAt = now.toISOString();
+    appendRecoveryAuditEntry(audit, {
+      auditId: randomUUID(), tenantId, eventId, recoveryGeneration, action: "RETIREMENT_SUPERSEDED",
+      actorId, createdAt: request.supersededAt, requestId: request.requestId, reasonCode: request.reasonCode, reference: request.reference
+    });
+  }
+}
+
+export class InMemoryCaseStore implements CaseStore {
+  protected readonly cases = new Map<string, RxCase>();
+  protected readonly idempotency = new Map<string, IdempotencyRecord>();
+  protected readonly outbox = new Map<string, OutboxRecord>();
+  protected readonly retirementRequests = new Map<string, OutboxRetirementApprovalRequest>();
+  protected readonly recoveryAudit: OutboxRecoveryAuditEntry[] = [];
+
+  get(id: string, tenantId?: string): RxCase | undefined {
+    const value = this.cases.get(id);
+    if (!value || (tenantId !== undefined && caseTenant(value) !== tenantId)) return undefined;
+    return cloneCase(value);
+  }
+
+  list(tenantId?: string): RxCase[] {
+    return [...this.cases.values()]
+      .filter((rxCase) => tenantId === undefined || caseTenant(rxCase) === tenantId)
+      .map(cloneCase);
+  }
+
+  save(rxCase: RxCase): void {
+    this.cases.set(rxCase.id, cloneCase(normalizeCaseVersion(rxCase)));
+  }
+
+  createCase(rxCase: RxCase, idempotencyKey: string, requestFingerprint: string, events: IntegrationEvent[] = []): void {
+    if (this.cases.has(rxCase.id)) throw new Error("case_already_exists");
+    const storageKey = idempotencyStorageKey(caseTenant(rxCase), idempotencyKey);
+    if (this.idempotency.has(storageKey)) throw new IdempotencyKeyAlreadyBoundError();
+    this.cases.set(rxCase.id, cloneCase(normalizeCaseVersion(rxCase)));
+    this.idempotency.set(storageKey, { caseId: rxCase.id, requestFingerprint });
+    this.enqueue(events);
+  }
+
+  saveWithOutbox(rxCase: RxCase, events: IntegrationEvent[]): void {
+    this.cases.set(rxCase.id, cloneCase(normalizeCaseVersion(rxCase)));
+    this.enqueue(events);
+  }
+
+  saveWithOutboxIfStatus(rxCase: RxCase, expectedStatus: WorkflowStatus, events: IntegrationEvent[]): boolean {
+    const current = this.cases.get(rxCase.id);
+    if (!current || current.status !== expectedStatus) return false;
+    this.cases.set(rxCase.id, cloneCase(normalizeCaseVersion(rxCase)));
+    this.enqueue(events);
+    return true;
+  }
+
+  saveWithOutboxIfVersion(rxCase: RxCase, expectedVersion: number, events: IntegrationEvent[]): boolean {
+    const current = this.cases.get(rxCase.id);
+    if (!current || normalizeCaseVersion(current).version !== expectedVersion) return false;
+    if (rxCase.version !== expectedVersion + 1) throw new Error("invalid_case_version_transition");
+    this.cases.set(rxCase.id, cloneCase(rxCase));
+    this.enqueue(events);
+    return true;
+  }
+
