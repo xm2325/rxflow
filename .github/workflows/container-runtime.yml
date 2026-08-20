@@ -1,0 +1,60 @@
+name: Container runtime contract
+
+on:
+  push:
+    branches:
+      - agent/rxflow-repair
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/container-runtime.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  container-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image
+        run: docker build --pull -t rxflow-ci:${GITHUB_SHA} .
+      - name: Load compiled runtime from image
+        run: >-
+          docker run --rm rxflow-ci:${GITHUB_SHA}
+          node --input-type=module -e
+          "import('./dist/src/version.js').then(m => { if (!m.VERSION) process.exit(2); console.log(m.VERSION); })"
+      - name: Assert non-root runtime
+        run: >-
+          docker run --rm rxflow-ci:${GITHUB_SHA}
+          node -e
+          "if (typeof process.getuid === 'function' && process.getuid() === 0) { console.error('container_runtime_is_root'); process.exit(1); } console.log(process.getuid?.());"
+      - name: Record observed container evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/ci-evidence
+          head_sha="$(git rev-parse HEAD)"
+          cat > docs/ci-evidence/container-runtime.json <<JSON
+          {
+            "schemaVersion": 1,
+            "suite": "container-runtime",
+            "observedIn": "github-actions",
+            "sourceCommit": "${head_sha}",
+            "checks": [
+              "docker-build",
+              "compiled-module-load",
+              "non-root-runtime"
+            ],
+            "result": "passed"
+          }
+          JSON
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/ci-evidence/container-runtime.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m '[skip ci] Record container runtime evidence'
+          git push origin HEAD:agent/rxflow-repair
