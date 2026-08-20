@@ -1,0 +1,19 @@
+  const requests = await store.listRetirementApprovalRequests(tenantId);
+  const pendingByEventGeneration = new Map(requests.filter((request) => request.status === "PENDING").map((request) => [`${request.eventId}\u001f${request.recoveryGeneration}`, request.requestId]));
+  const byCase = new Map<string, typeof records>();
+  for (const record of records) {
+    if (!Number.isInteger(record.event.aggregateSequence)) continue;
+    const group = byCase.get(record.event.caseId) ?? []; group.push(record); byCase.set(record.event.caseId, group);
+  }
+  const views: BlockedAggregateRecoveryView[] = [];
+  for (const [caseId, group] of byCase) {
+    group.sort((a,b) => (a.event.aggregateSequence ?? 0) - (b.event.aggregateSequence ?? 0));
+    const head = group.find((record) => record.status !== "PUBLISHED" && record.status !== "RETIRED");
+    if (!head || head.status !== "DEAD_LETTER" || (head.recoveryGeneration ?? 0) < 1) continue;
+    const seq = head.event.aggregateSequence ?? 0;
+    const blockedFollowers = group.filter((record) => (record.event.aggregateSequence ?? 0) > seq && record.status === "PENDING").length;
+    views.push({ caseId, headEventId: head.event.eventId, headType: head.event.type, recoveryGeneration: head.recoveryGeneration ?? 0,
+      recoveryEtag: outboxRecoveryEtag(head.event.eventId, head.recoveryGeneration ?? 0), blockedFollowers, pendingRetirementRequestId: pendingByEventGeneration.get(`${head.event.eventId}\u001f${head.recoveryGeneration ?? 0}`) ?? null });
+  }
+  return views;
+}
