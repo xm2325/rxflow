@@ -1,0 +1,222 @@
+      Number.isInteger(event.aggregateSequence) ? event.caseId : null,
+      Number.isInteger(event.aggregateSequence) ? event.aggregateSequence : null,
+      JSON.stringify(event),
+      event.occurredAt
+    );
+  }
+
+  private ensureOutboxSchema(): void {
+    const existing = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbox'").get() as SqliteSchemaRow | undefined;
+    if (!existing) {
+      this.createOutboxTable("outbox");
+      return;
+    }
+    const sql = existing.sql ?? "";
+    const hasClaims = sql.includes("IN_FLIGHT") && sql.includes("claim_id") && sql.includes("lease_until");
+    const current = hasClaims && sql.includes("next_attempt_at");
+    if (current) {
+      this.createOutboxIndexes();
+      return;
+    }
+
+    this.transaction(() => {
+      this.createOutboxTable("outbox_v3");
+      if (hasClaims) {
+        this.db.exec(`
+          INSERT INTO outbox_v3(event_id, event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until)
+          SELECT event_id, event_json, status, attempts, last_error, published_at, claim_id, claimed_by, lease_until FROM outbox;
+        `);
+      } else {
+        this.db.exec(`
+          INSERT INTO outbox_v3(event_id, event_json, status, attempts, last_error, published_at)
+          SELECT event_id, event_json, status, attempts, last_error, published_at FROM outbox;
+        `);
+      }
+      this.db.exec(`
+        DROP TABLE outbox;
+        ALTER TABLE outbox_v3 RENAME TO outbox;
+      `);
+      this.createOutboxIndexes();
+    });
+  }
+
+  private createOutboxTable(name: "outbox" | "outbox_v3" | "outbox_v5"): void {
+    this.db.exec(`
+      CREATE TABLE ${name} (
+        event_id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        aggregate_case_id TEXT,
+        aggregate_sequence INTEGER,
+        event_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('PENDING','IN_FLIGHT','PUBLISHED','DEAD_LETTER','RETIRED')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        published_at TEXT,
+        claim_id TEXT,
+        claimed_by TEXT,
+        lease_until TEXT,
+        next_attempt_at TEXT,
+        created_at TEXT,
+        retired_at TEXT,
+        retired_by TEXT,
+        retirement_reason_code TEXT,
+        retirement_reference TEXT,
+        replacement_event_id TEXT,
+        recovery_generation INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    if (name === "outbox") this.createOutboxIndexes();
+  }
+
+  private createOutboxIndexes(): void {
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_outbox_lease ON outbox(status, lease_until)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_outbox_retry ON outbox(status, next_attempt_at)");
+  }
+
+  private ensureOutboxAgeSchema(): void {
+    const columns = this.db.prepare("PRAGMA table_info(outbox)").all() as SqliteColumnRow[];
+    if (!columns.some((column) => column.name === "created_at")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN created_at TEXT");
+    }
+    const rows = this.db.prepare("SELECT event_id, event_json, created_at FROM outbox WHERE created_at IS NULL OR created_at = ''").all() as Array<{ event_id: string; event_json: string; created_at: string | null }>;
+    const update = this.db.prepare("UPDATE outbox SET created_at = ? WHERE event_id = ?");
+    for (const row of rows) {
+      let createdAt = new Date().toISOString();
+      try {
+        const event = JSON.parse(row.event_json) as IntegrationEvent;
+        if (Number.isFinite(Date.parse(event.occurredAt))) createdAt = event.occurredAt;
+      } catch { /* keep conservative migration timestamp */ }
+      update.run(createdAt, row.event_id);
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_outbox_status_created_at ON outbox(status, created_at)");
+  }
+
+  private ensureTenantSchema(): void {
+    const ensureColumn = (table: "cases" | "idempotency" | "outbox"): boolean => {
+      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as SqliteColumnRow[];
+      if (columns.some((column) => column.name === "tenant_id")) return false;
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'`);
+      return true;
+    };
+    const casesAdded = ensureColumn("cases");
+    const idempotencyAdded = ensureColumn("idempotency");
+    const outboxAdded = ensureColumn("outbox");
+
+    // Parse legacy JSON only during the one-time column migration. Normal startup
+    // and tenant-qualified reads can then stay inside relational tenant filters.
+    if (casesAdded) {
+      const caseRows = this.db.prepare("SELECT id, case_json FROM cases").all() as SqliteCaseTenantRow[];
+      const updateCase = this.db.prepare("UPDATE cases SET tenant_id = ? WHERE id = ?");
+      for (const row of caseRows) updateCase.run(caseTenant(JSON.parse(row.case_json) as RxCase), row.id);
+    }
+
+    if (idempotencyAdded) {
+      this.db.exec(`
+        UPDATE idempotency
+        SET tenant_id = COALESCE((SELECT tenant_id FROM cases WHERE cases.id = idempotency.case_id), 'default')
+      `);
+    }
+
+    if (outboxAdded) {
+      const outboxRows = this.db.prepare("SELECT event_id, event_json FROM outbox").all() as SqliteOutboxTenantRow[];
+      const updateOutbox = this.db.prepare("UPDATE outbox SET tenant_id = ? WHERE event_id = ?");
+      for (const row of outboxRows) updateOutbox.run(eventTenant(JSON.parse(row.event_json) as IntegrationEvent), row.event_id);
+    }
+
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_cases_tenant ON cases(tenant_id, id)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_idempotency_tenant ON idempotency(tenant_id, key)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_outbox_status_tenant_created_at ON outbox(status, tenant_id, created_at)");
+  }
+
+  private ensureOutboxAggregateSchema(): void {
+    const columns = this.db.prepare("PRAGMA table_info(outbox)").all() as SqliteColumnRow[];
+    if (!columns.some((column) => column.name === "aggregate_case_id")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN aggregate_case_id TEXT");
+    }
+    if (!columns.some((column) => column.name === "aggregate_sequence")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN aggregate_sequence INTEGER");
+    }
+
+    const rows = this.db.prepare(`
+      SELECT event_id, event_json
+      FROM outbox
+      WHERE aggregate_case_id IS NULL OR aggregate_sequence IS NULL
+    `).all() as SqliteOutboxTenantRow[];
+    const update = this.db.prepare("UPDATE outbox SET aggregate_case_id = ?, aggregate_sequence = ? WHERE event_id = ?");
+    for (const row of rows) {
+      try {
+        const event = JSON.parse(row.event_json) as IntegrationEvent;
+        if (Number.isInteger(event.aggregateSequence) && (event.aggregateSequence ?? 0) >= 1) {
+          update.run(event.caseId, event.aggregateSequence, row.event_id);
+        }
+      } catch { /* leave unsequenced legacy/invalid rows independent */ }
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_outbox_aggregate_order ON outbox(tenant_id, aggregate_case_id, aggregate_sequence, status)");
+  }
+
+  private ensureOutboxRetirementSchema(): void {
+    const existing = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbox'").get() as SqliteSchemaRow | undefined;
+    const columns = this.db.prepare("PRAGMA table_info(outbox)").all() as SqliteColumnRow[];
+    const hasRetiredStatus = (existing?.sql ?? "").includes("RETIRED");
+    const requiredColumns = ["retired_at", "retired_by", "retirement_reason_code", "retirement_reference", "replacement_event_id"];
+    const hasColumns = requiredColumns.every((name) => columns.some((column) => column.name === name));
+    if (hasRetiredStatus && hasColumns) return;
+
+    this.transaction(() => {
+      this.createOutboxTable("outbox_v5");
+      const oldColumns = new Set((this.db.prepare("PRAGMA table_info(outbox)").all() as SqliteColumnRow[]).map((column) => column.name));
+      const copy = [
+        "event_id", "tenant_id", "aggregate_case_id", "aggregate_sequence", "event_json", "status", "attempts",
+        "last_error", "published_at", "claim_id", "claimed_by", "lease_until", "next_attempt_at", "created_at",
+        "retired_at", "retired_by", "retirement_reason_code", "retirement_reference", "replacement_event_id"
+      ].filter((column) => oldColumns.has(column));
+      const destination = copy.join(", ");
+      this.db.exec(`INSERT INTO outbox_v5(${destination}) SELECT ${destination} FROM outbox`);
+      this.db.exec("DROP TABLE outbox; ALTER TABLE outbox_v5 RENAME TO outbox;");
+      this.createOutboxIndexes();
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_outbox_aggregate_order ON outbox(tenant_id, aggregate_case_id, aggregate_sequence, status)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_outbox_retired ON outbox(status, retired_at)");
+    });
+  }
+
+  private ensureOutboxRecoveryGenerationSchema(): void {
+    const columns = this.db.prepare("PRAGMA table_info(outbox)").all() as SqliteColumnRow[];
+    if (!columns.some((column) => column.name === "recovery_generation")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0");
+    }
+  }
+
+  private ensureOutboxRecoveryApprovalSchema(): void {
+    const requestTable = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='outbox_retirement_requests'").get() as SqliteSchemaRow | undefined;
+    if (!requestTable) {
+      this.db.exec(`
+        CREATE TABLE outbox_retirement_requests (
+          request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_id TEXT NOT NULL, recovery_generation INTEGER NOT NULL CHECK(recovery_generation >= 1),
+          requested_by TEXT NOT NULL, reason_code TEXT NOT NULL, reference TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('PENDING','APPROVED','SUPERSEDED')),
+          requested_at TEXT NOT NULL, approved_by TEXT, approved_at TEXT, replacement_event_id TEXT, superseded_by TEXT, superseded_at TEXT,
+          UNIQUE(tenant_id, event_id, recovery_generation)
+        );
+      `);
+    } else if (!(requestTable.sql ?? "").includes("SUPERSEDED")) {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE outbox_retirement_requests_v8 (
+            request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_id TEXT NOT NULL, recovery_generation INTEGER NOT NULL CHECK(recovery_generation >= 1),
+            requested_by TEXT NOT NULL, reason_code TEXT NOT NULL, reference TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('PENDING','APPROVED','SUPERSEDED')),
+            requested_at TEXT NOT NULL, approved_by TEXT, approved_at TEXT, replacement_event_id TEXT, superseded_by TEXT, superseded_at TEXT,
+            UNIQUE(tenant_id, event_id, recovery_generation)
+          );
+          INSERT INTO outbox_retirement_requests_v8(request_id,tenant_id,event_id,recovery_generation,requested_by,reason_code,reference,status,requested_at,approved_by,approved_at,replacement_event_id)
+          SELECT request_id,tenant_id,event_id,recovery_generation,requested_by,reason_code,reference,status,requested_at,approved_by,approved_at,replacement_event_id FROM outbox_retirement_requests;
+          DROP TABLE outbox_retirement_requests;
+          ALTER TABLE outbox_retirement_requests_v8 RENAME TO outbox_retirement_requests;
+        `);
+      });
+    }
+    const auditTable = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='outbox_recovery_audit'").get() as SqliteSchemaRow | undefined;
+    if (!auditTable) {
+      this.db.exec(`
+        CREATE TABLE outbox_recovery_audit (
+          audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_id TEXT NOT NULL, recovery_generation INTEGER NOT NULL,
+          action TEXT NOT NULL CHECK(action IN ('REDRIVEN','RETIREMENT_REQUESTED','RETIREMENT_APPROVED','RETIREMENT_SUPERSEDED')), actor_id TEXT NOT NULL, created_at TEXT NOT NULL,
