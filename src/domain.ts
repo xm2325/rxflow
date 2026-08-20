@@ -57,6 +57,7 @@ export interface ReviewDecisionReceipt {
   edited: boolean;
   createdAt: string;
   secondReviewer?: string;
+  decisionKeyHash?: string;
 }
 
 export interface ReviewEscalation {
