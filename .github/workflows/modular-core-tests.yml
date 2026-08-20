@@ -1,0 +1,66 @@
+name: Modular core tests
+
+on:
+  push:
+    branches:
+      - agent/rxflow-repair
+    paths:
+      - 'src/**'
+      - 'test/workflow-core.test.ts'
+      - 'test/fhir-contract.test.ts'
+      - 'test/outbox-contract.test.ts'
+      - 'test/config-contract.test.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - '.github/workflows/modular-core-tests.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Run modular core suite
+        run: >-
+          node --test
+          dist/test/workflow-core.test.js
+          dist/test/fhir-contract.test.js
+          dist/test/outbox-contract.test.js
+          dist/test/config-contract.test.js
+      - name: Record observed CI evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/ci-evidence
+          head_sha="$(git rev-parse HEAD)"
+          cat > docs/ci-evidence/modular-core-tests.json <<JSON
+          {
+            "schemaVersion": 1,
+            "suite": "modular-core-tests",
+            "observedIn": "github-actions",
+            "sourceCommit": "${head_sha}",
+            "node": "22",
+            "tests": [
+              "workflow-core",
+              "fhir-contract",
+              "outbox-contract",
+              "config-contract"
+            ],
+            "result": "passed"
+          }
+          JSON
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/ci-evidence/modular-core-tests.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m '[skip ci] Record modular core test evidence'
+          git push origin HEAD:agent/rxflow-repair
